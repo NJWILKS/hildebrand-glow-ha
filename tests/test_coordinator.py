@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from unittest.mock import AsyncMock
@@ -21,11 +22,11 @@ class FakeStore:
         self.state = state if state is not None else {}
 
     async def async_load(self) -> dict:
-        return self.state
+        return deepcopy(self.state)
 
     async def async_save(self, data: dict) -> None:
         self.state.clear()
-        self.state.update(data)
+        self.state.update(deepcopy(data))
 
 
 class FakeApi:
