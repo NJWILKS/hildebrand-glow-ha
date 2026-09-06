@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -38,6 +38,18 @@ def _canonical_digest(intervals: list[tuple[datetime, float]]) -> str:
         for timestamp, value in intervals
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _timestamp_geometry(
+    start: datetime,
+    end: datetime,
+    intervals: list[tuple[datetime, float]],
+) -> tuple[list[int], list[int]]:
+    start_epoch = int(start.astimezone(timezone.utc).timestamp())
+    end_epoch = int(end.astimezone(timezone.utc).timestamp())
+    expected_epochs = set(range(start_epoch, end_epoch, 1800))
+    actual_epochs = {int(timestamp.timestamp()) for timestamp, _ in intervals}
+    return sorted(expected_epochs - actual_epochs), sorted(actual_epochs - expected_epochs)
 
 
 async def _known_electricity_resource(
@@ -98,7 +110,12 @@ async def test_live_account_matches_known_electricity_export() -> None:
                 pytest.fail(f"Live contract: no completed-day data for case {day}")
 
             if len(reading.intervals) != expected["intervals"]:
-                pytest.fail(f"Live contract: interval count mismatch for case {day}")
+                missing, extra = _timestamp_geometry(start, end, reading.intervals)
+                pytest.fail(
+                    "Live contract: interval geometry mismatch for case "
+                    f"{day}; expected={expected['intervals']} actual={len(reading.intervals)} "
+                    f"missing={missing[:5]} extra={extra[:5]}"
+                )
             if reading.value != expected["kwh"]:
                 pytest.fail(f"Live contract: daily total mismatch for case {day}")
             if _canonical_digest(reading.intervals) != expected["sha256"]:
