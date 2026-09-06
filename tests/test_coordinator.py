@@ -46,7 +46,12 @@ class FakeApi:
         self.get_available_readings = AsyncMock(return_value={})
 
 
-def _make_coordinator(hass, api: FakeApi, virtual_entity_id: str | None = None):
+def _make_coordinator(
+    hass,
+    api: FakeApi,
+    virtual_entity_id: str | None = None,
+    entry_id: str = "default",
+):
     coordinator = GlowmarktDataUpdateCoordinator(
         hass,
         api,  # type: ignore[arg-type]
@@ -57,6 +62,7 @@ def _make_coordinator(hass, api: FakeApi, virtual_entity_id: str | None = None):
             "gas_standing_charge": 0.30,
         },
         virtual_entity_id=virtual_entity_id,
+        entry_id=entry_id,
     )
     coordinator._store = FakeStore()
     coordinator._backfill_started = True
@@ -100,6 +106,15 @@ async def test_coordinator_discovers_only_configured_virtual_entity(hass) -> Non
     await coordinator._async_update_data()
 
     api.discover_resources.assert_awaited_once_with("site-2")
+
+
+def test_coordinator_identity_survives_config_entry_recreation(hass) -> None:
+    api = FakeApi()
+    first = _make_coordinator(hass, api, virtual_entity_id="site-2", entry_id="entry-a")
+    second = _make_coordinator(hass, api, virtual_entity_id="site-2", entry_id="entry-b")
+
+    assert first._site_id == "site-2"
+    assert second._site_id == "site-2"
 
 
 @pytest.mark.asyncio

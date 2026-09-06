@@ -11,6 +11,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig, SelectSelectorMode
 from .api import GlowmarktApiClient, GlowmarktAuthError, GlowmarktApiError
 from .const import DOMAIN, CONF_VIRTUAL_ENTITY, CONF_ELECTRICITY_RATE, CONF_GAS_RATE, CONF_ELECTRICITY_STANDING_CHARGE, CONF_GAS_STANDING_CHARGE, DEFAULT_ELECTRICITY_RATE, DEFAULT_GAS_RATE, DEFAULT_ELECTRICITY_STANDING_CHARGE, DEFAULT_GAS_STANDING_CHARGE
+from .identity import config_unique_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,7 +62,12 @@ class HildebrandGlowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_tariff(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
             data = {**self._user_data, **user_input}
-            await self.async_set_unique_id(self._user_data[CONF_USERNAME].lower())
+            await self.async_set_unique_id(
+                config_unique_id(
+                    self._user_data[CONF_USERNAME],
+                    self._user_data[CONF_VIRTUAL_ENTITY],
+                )
+            )
             self._abort_if_unique_id_configured()
             title = getattr(self, "_ve_name", None) or f"Smart Meter ({self._user_data[CONF_USERNAME]})"
             return self.async_create_entry(title=title, data=data)

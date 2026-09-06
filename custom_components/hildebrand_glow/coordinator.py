@@ -24,6 +24,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
+from .identity import sensor_unique_id, site_identity
 
 _LOGGER = logging.getLogger(__name__)
 CUMULATIVE_CLASSIFIERS = (
@@ -54,12 +55,13 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.tariff_config = tariff_config
         self._virtual_entity_id = virtual_entity_id
         self._entry_id = entry_id
+        self._site_id = site_identity(virtual_entity_id, entry_id)
         self._resources: dict[str, dict[str, Any]] = {}
         self._last_readings: dict[str, DailyReading] = {}
         self._store = Store(
             hass,
             CUMULATIVE_STORAGE_VERSION,
-            f"{DOMAIN}_{entry_id}_cumulative",
+            f"{DOMAIN}_{self._site_id}_cumulative",
         )
         self._cumulative: dict[str, Any] | None = None
         self._cumulative_lock = asyncio.Lock()
@@ -67,7 +69,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _entity_id_for(self, classifier: str) -> str | None:
         registry = er.async_get(self.hass)
-        unique_id = f"{self._entry_id}_{classifier}"
+        unique_id = sensor_unique_id(self._site_id, classifier)
         return registry.async_get_entity_id("sensor", DOMAIN, unique_id)
 
     @staticmethod

@@ -9,8 +9,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from .const import ATTRIBUTION, DOMAIN, CLASSIFIER_ELECTRICITY_CONSUMPTION, CLASSIFIER_ELECTRICITY_COST, CLASSIFIER_GAS_CONSUMPTION, CLASSIFIER_GAS_COST
+from .const import ATTRIBUTION, DOMAIN, CONF_VIRTUAL_ENTITY, CLASSIFIER_ELECTRICITY_CONSUMPTION, CLASSIFIER_ELECTRICITY_COST, CLASSIFIER_GAS_CONSUMPTION, CLASSIFIER_GAS_COST
 from .coordinator import GlowmarktDataUpdateCoordinator
+from .identity import sensor_unique_id, site_identity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,25 +30,26 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     coordinator: GlowmarktDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
     entities: list[GlowmarktSensor] = []
     await coordinator.async_config_entry_first_refresh()
+    site_id = site_identity(config_entry.data.get(CONF_VIRTUAL_ENTITY), config_entry.entry_id)
     for sensor_key, description in SENSOR_DESCRIPTIONS.items():
-        entities.append(GlowmarktSensor(coordinator=coordinator, sensor_key=sensor_key, description=description, entry_id=config_entry.entry_id))
+        entities.append(GlowmarktSensor(coordinator=coordinator, sensor_key=sensor_key, description=description, site_id=site_id))
     async_add_entities(entities)
 
 class GlowmarktSensor(CoordinatorEntity[GlowmarktDataUpdateCoordinator], SensorEntity):
     _attr_attribution = ATTRIBUTION
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator: GlowmarktDataUpdateCoordinator, sensor_key: str, description: dict[str, Any], entry_id: str) -> None:
+    def __init__(self, coordinator: GlowmarktDataUpdateCoordinator, sensor_key: str, description: dict[str, Any], site_id: str) -> None:
         super().__init__(coordinator)
         self._sensor_key = sensor_key
         self._description = description
-        self._attr_unique_id = f"{entry_id}_{sensor_key}"
+        self._attr_unique_id = sensor_unique_id(site_id, sensor_key)
         self._attr_name = description["name"]
         self._attr_icon = description.get("icon")
         self._attr_device_class = description.get("device_class")
         self._attr_state_class = description.get("state_class")
         self._attr_native_unit_of_measurement = description.get("native_unit_of_measurement")
-        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, entry_id)}, name="Smart Meter", manufacturer="Hildebrand Technology", model="SMETS2 via Glow/Bright", configuration_url="https://glowmarkt.com/")
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, site_id)}, name="Smart Meter", manufacturer="Hildebrand Technology", model="SMETS2 via Glow/Bright", configuration_url="https://glowmarkt.com/")
 
     @property
     def native_value(self) -> float | None:
