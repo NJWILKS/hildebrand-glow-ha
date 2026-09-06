@@ -3,7 +3,7 @@
   "name": "Hildebrand Glow (Bright App)",
   "codeowners": ["@xmcdanx"],
   "config_flow": true,
-  "dependencies": [],
+  "dependencies": ["recorder"],
   "documentation": "https://github.com/xmcdanx/hildebrand-glow-ha",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
