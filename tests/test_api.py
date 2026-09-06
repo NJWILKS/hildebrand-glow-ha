@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -44,16 +44,18 @@ def _authenticated_client(session: FakeSession) -> GlowmarktApiClient:
 
 
 @pytest.mark.asyncio
-async def test_daily_reading_sums_half_hour_values() -> None:
+async def test_daily_reading_returns_complete_day_with_intervals(freezer) -> None:
+    freezer.move_to("2026-09-06 12:00:00")
+    start = int(datetime(2026, 9, 5, 0, 0, tzinfo=timezone.utc).timestamp())
     session = FakeSession(
         [
             {
                 "status": "OK",
                 "data": [
-                    [1_700_000_000, 0.101],
-                    [1_700_001_800, 0.202],
-                    [1_700_003_600, None],
-                    [1_700_005_400, 0.303],
+                    [start, 0.101],
+                    [start + 1800, 0.202],
+                    [start + 3600, None],
+                    [start + 5400, 0.303],
                 ],
             }
         ]
@@ -62,17 +64,48 @@ async def test_daily_reading_sums_half_hour_values() -> None:
 
     result = await client.get_daily_reading("electricity-resource")
 
-    assert result == 0.606
+    assert result is not None
+    assert result.day == "2026-09-05"
+    assert result.value == 0.606
+    assert len(result.intervals) == 3
     assert session.get_calls[0][1]["params"]["period"] == "PT30M"
     assert session.get_calls[0][1]["params"]["function"] == "sum"
 
 
 @pytest.mark.asyncio
-async def test_daily_reading_returns_none_when_api_has_no_data() -> None:
-    session = FakeSession([{"status": "OK", "data": []}])
+async def test_daily_reading_skips_zero_placeholder_day(freezer) -> None:
+    freezer.move_to("2026-09-06 12:00:00")
+    start = int(datetime(2026, 9, 4, 0, 0, tzinfo=timezone.utc).timestamp())
+    session = FakeSession(
+        [
+            {"status": "OK", "data": [[start + 86400, 0.0], [start + 88200, 0.0]]},
+            {"status": "OK", "data": [[start, 0.4], [start + 1800, 0.6]]},
+        ]
+    )
+    client = _authenticated_client(session)
+
+    result = await client.get_daily_reading("electricity-resource")
+
+    assert result is not None
+    assert result.day == "2026-09-04"
+    assert result.value == 1.0
+    assert len(session.get_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_daily_reading_returns_none_after_three_empty_days(freezer) -> None:
+    freezer.move_to("2026-09-06 12:00:00")
+    session = FakeSession(
+        [
+            {"status": "OK", "data": []},
+            {"status": "OK", "data": [[1_700_000_000, 0.0]]},
+            {"status": "OK", "data": [[1_699_913_600, None]]},
+        ]
+    )
     client = _authenticated_client(session)
 
     assert await client.get_daily_reading("electricity-resource") is None
+    assert len(session.get_calls) == 3
 
 
 @pytest.mark.asyncio
