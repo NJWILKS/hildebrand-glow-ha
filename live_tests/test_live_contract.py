@@ -32,11 +32,10 @@ def _oracle() -> dict:
     return json.loads(ORACLE.read_text(encoding="utf-8"))
 
 
-def _canonical_digest(rows: list[list[object]]) -> str:
+def _canonical_digest(intervals: list[tuple[datetime, float]]) -> str:
     canonical = "\n".join(
-        f"{int(row[0])}:{float(row[1]):.3f}"
-        for row in rows
-        if len(row) > 1 and row[1] is not None
+        f"{int(timestamp.timestamp())}:{value:.3f}"
+        for timestamp, value in intervals
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -90,17 +89,17 @@ async def test_live_account_matches_known_electricity_export() -> None:
             expected = oracle["known_days"][day]
             start = datetime.fromisoformat(day).replace(tzinfo=UK_TZ)
             end = start + timedelta(days=1)
-            rows = await client._request_readings(
+            reading = await client._fetch_day_reading(
                 resource_id,
                 start,
                 end,
-                "PT30M",
             )
-            valid = [row for row in rows if len(row) > 1 and row[1] is not None]
+            if reading is None:
+                pytest.fail(f"Live contract: no completed-day data for case {day}")
 
-            if len(valid) != expected["intervals"]:
+            if len(reading.intervals) != expected["intervals"]:
                 pytest.fail(f"Live contract: interval count mismatch for case {day}")
-            if round(sum(float(row[1]) for row in valid), 3) != expected["kwh"]:
+            if reading.value != expected["kwh"]:
                 pytest.fail(f"Live contract: daily total mismatch for case {day}")
-            if _canonical_digest(valid) != expected["sha256"]:
+            if _canonical_digest(reading.intervals) != expected["sha256"]:
                 pytest.fail(f"Live contract: interval fingerprint mismatch for case {day}")
