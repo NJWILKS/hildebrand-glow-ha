@@ -12,6 +12,12 @@ def config_unique_id(username: str, virtual_entity_id: str) -> str:
     return f"{username.strip().lower()}:{virtual_entity_id}"
 
 
-def sensor_unique_id(site_id: str, sensor_key: str) -> str:
-    """Return a stable entity unique ID for a meter site and sensor."""
+def sensor_unique_id(
+    site_id: str,
+    sensor_key: str,
+    resource_id: str | None = None,
+) -> str:
+    """Return a stable entity ID, preferring the Glow resource when available."""
+    if resource_id:
+        return f"{resource_id}_{sensor_key}"
     return f"{site_id}_{sensor_key}"
