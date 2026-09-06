@@ -1,6 +1,7 @@
 """Glowmarkt API client for Hildebrand Glow integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -15,9 +16,15 @@ from .const import GLOWMARKT_API_BASE, GLOWMARKT_APP_ID
 _LOGGER = logging.getLogger(__name__)
 UK_TZ = ZoneInfo("Europe/London")
 
-# Glowmarkt rejects wider daily aggregate windows, so probe history in chunks.
-CHUNK_PROBE_DAYS = 30
-CHUNK_PROBE_LIMIT = 24
+# Glowmarkt returns Unix timestamps. Scanning to the Unix epoch gives us a
+# deterministic lower boundary without imposing an arbitrary history horizon.
+UNIX_EPOCH_YEAR = 1970
+
+# Hildebrand documents a maximum PT30M query span of 10 days. Use nine UK-local
+# calendar days so a 25-hour autumn DST day can never make the UTC span exceed
+# that API limit.
+HISTORY_INTERVAL_DAYS = 9
+HISTORY_MAX_RETRIES = 4
 
 
 @dataclass
@@ -148,6 +155,66 @@ class GlowmarktApiClient:
                 _LOGGER.error("Failed to get resources for %s: %s", ve_id, err)
         return self._resources
 
+    async def _request_readings(
+        self,
+        resource_id: str,
+        start: datetime,
+        end: datetime,
+        period: str,
+    ) -> list[list[Any]]:
+        """Fetch a readings window, retrying 429s but never treating errors as no data."""
+        params = {
+            "from": start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "to": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "period": period,
+            "offset": 0,
+            "function": "sum",
+        }
+
+        for attempt in range(HISTORY_MAX_RETRIES + 1):
+            try:
+                async with self._session.get(
+                    f"{GLOWMARKT_API_BASE}/resource/{resource_id}/readings",
+                    headers=self._get_headers(),
+                    params=params,
+                ) as response:
+                    if response.status == 429 and attempt < HISTORY_MAX_RETRIES:
+                        headers = getattr(response, "headers", {})
+                        retry_after = headers.get("Retry-After") if headers else None
+                        try:
+                            delay = float(retry_after) if retry_after is not None else 2**attempt
+                        except (TypeError, ValueError):
+                            delay = 2**attempt
+                        _LOGGER.warning(
+                            "Glowmarkt rate limited %s; retrying in %.1fs",
+                            resource_id,
+                            delay,
+                        )
+                        await asyncio.sleep(min(delay, 30.0))
+                        continue
+
+                    response.raise_for_status()
+                    data = await response.json()
+                    if data.get("status") != "OK":
+                        raise GlowmarktApiError(
+                            f"Readings query failed for {resource_id}: {data.get('status')}"
+                        )
+                    rows = data.get("data", [])
+                    return rows if isinstance(rows, list) else []
+            except ClientResponseError as err:
+                if err.status == 429 and attempt < HISTORY_MAX_RETRIES:
+                    await asyncio.sleep(min(float(2**attempt), 30.0))
+                    continue
+                raise GlowmarktApiError(
+                    f"Readings query failed for {resource_id}: {err}"
+                ) from err
+            except ClientError as err:
+                raise GlowmarktApiError(
+                    f"Readings query failed for {resource_id}: {err}"
+                ) from err
+
+        raise GlowmarktApiError(f"Readings query exhausted retries for {resource_id}")
+
     async def _fetch_day_reading(
         self,
         resource_id: str,
@@ -156,55 +223,33 @@ class GlowmarktApiClient:
         days_back: int | None = None,
     ) -> DailyReading | None:
         """Fetch one explicit UK-local day and return it only when data is real."""
-        day_start_utc = day_start_uk.astimezone(timezone.utc)
-        day_end_utc = day_end_uk.astimezone(timezone.utc)
-        params = {
-            "from": day_start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-            "to": day_end_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-            "period": "PT30M",
-            "offset": 0,
-            "function": "sum",
-        }
         _LOGGER.debug(
             "Fetching %s (%s) from %s to %s",
             resource_id,
             f"{days_back} day(s) back" if days_back is not None else day_start_uk.date(),
-            params["from"],
-            params["to"],
+            day_start_uk,
+            day_end_uk,
         )
-        try:
-            async with self._session.get(
-                f"{GLOWMARKT_API_BASE}/resource/{resource_id}/readings",
-                headers=self._get_headers(),
-                params=params,
-            ) as response:
-                response.raise_for_status()
-                data = await response.json()
-                if data.get("status") != "OK" or not data.get("data"):
-                    return None
-
-                valid = [row for row in data["data"] if row[1] is not None]
-                total = sum(row[1] for row in valid)
-                if total <= 0:
-                    return None
-
-                intervals = [
-                    (datetime.fromtimestamp(row[0], tz=timezone.utc), row[1])
-                    for row in valid
-                ]
-                return DailyReading(
-                    day=day_start_uk.date().isoformat(),
-                    value=round(total, 3),
-                    intervals=intervals,
-                )
-        except (ClientResponseError, ClientError) as err:
-            _LOGGER.error(
-                "Failed to get reading for %s (%s): %s",
-                resource_id,
-                day_start_uk.date(),
-                err,
-            )
+        rows = await self._request_readings(
+            resource_id,
+            day_start_uk,
+            day_end_uk,
+            "PT30M",
+        )
+        valid = [row for row in rows if len(row) > 1 and row[1] is not None]
+        total = sum(float(row[1]) for row in valid)
+        if total <= 0:
             return None
+
+        intervals = [
+            (datetime.fromtimestamp(row[0], tz=timezone.utc), float(row[1]))
+            for row in valid
+        ]
+        return DailyReading(
+            day=day_start_uk.date().isoformat(),
+            value=round(total, 3),
+            intervals=intervals,
+        )
 
     async def get_daily_reading(self, resource_id: str) -> DailyReading | None:
         """Return the latest completed non-zero day, allowing for API delay."""
@@ -233,64 +278,133 @@ class GlowmarktApiClient:
         )
         return None
 
+    @staticmethod
+    def _next_month(value: datetime) -> datetime:
+        if value.month == 12:
+            return value.replace(year=value.year + 1, month=1, day=1)
+        return value.replace(month=value.month + 1, day=1)
+
     async def _find_data_start(self, resource_id: str) -> datetime | None:
-        """Discover the earliest available day without guessing a fixed history size."""
-        now_uk = datetime.now(UK_TZ).replace(
+        """Find the first available day by exhaustively probing every API year."""
+        await self._ensure_authenticated()
+        now_utc = datetime.now(timezone.utc)
+        earliest_year: int | None = None
+
+        # P1Y is limited to 366 days, so query one calendar year at a time.
+        # We deliberately scan every year back to the Unix epoch instead of
+        # stopping after N empty windows: a long data gap must not hide older data.
+        for year in range(now_utc.year, UNIX_EPOCH_YEAR - 1, -1):
+            year_start = datetime(year, 1, 1, tzinfo=timezone.utc)
+            year_end = min(
+                datetime(year + 1, 1, 1, tzinfo=timezone.utc),
+                now_utc,
+            )
+            if year_end <= year_start:
+                continue
+            rows = await self._request_readings(
+                resource_id,
+                year_start,
+                year_end,
+                "P1Y",
+            )
+            if any(
+                len(row) > 1 and row[1] is not None and float(row[1]) > 0
+                for row in rows
+            ):
+                earliest_year = year
+
+        if earliest_year is None:
+            return None
+
+        year_start = datetime(earliest_year, 1, 1, tzinfo=timezone.utc)
+        year_end = datetime(earliest_year + 1, 1, 1, tzinfo=timezone.utc)
+        month_rows = await self._request_readings(
+            resource_id,
+            year_start,
+            year_end,
+            "P1M",
+        )
+        positive_months = [
+            row
+            for row in month_rows
+            if len(row) > 1 and row[1] is not None and float(row[1]) > 0
+        ]
+        if not positive_months:
+            return year_start.astimezone(UK_TZ) - timedelta(days=1)
+
+        earliest_month = datetime.fromtimestamp(
+            min(row[0] for row in positive_months),
+            tz=timezone.utc,
+        ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_end = self._next_month(earliest_month)
+        day_rows = await self._request_readings(
+            resource_id,
+            earliest_month,
+            month_end,
+            "P1D",
+        )
+        positive_days = [
+            row
+            for row in day_rows
+            if len(row) > 1 and row[1] is not None and float(row[1]) > 0
+        ]
+        if not positive_days:
+            return earliest_month.astimezone(UK_TZ) - timedelta(days=1)
+
+        earliest_day_utc = datetime.fromtimestamp(
+            min(row[0] for row in positive_days),
+            tz=timezone.utc,
+        )
+        # Aggregate bucket boundaries are UTC here. Begin one UK-local day
+        # earlier so DST/bucket alignment can never omit the first intervals.
+        return earliest_day_utc.astimezone(UK_TZ).replace(
             hour=0,
             minute=0,
             second=0,
             microsecond=0,
+        ) - timedelta(days=1)
+
+    async def _fetch_history_chunk(
+        self,
+        resource_id: str,
+        start_uk: datetime,
+        end_uk: datetime,
+    ) -> list[DailyReading]:
+        """Fetch a multi-day PT30M window and split it into UK-local days."""
+        rows = await self._request_readings(
+            resource_id,
+            start_uk,
+            end_uk,
+            "PT30M",
         )
-        earliest: datetime | None = None
-        consecutive_empty = 0
+        by_day: dict[str, list[tuple[datetime, float]]] = {}
+        for row in rows:
+            if len(row) <= 1 or row[1] is None:
+                continue
+            timestamp = datetime.fromtimestamp(row[0], tz=timezone.utc)
+            timestamp_uk = timestamp.astimezone(UK_TZ)
+            if timestamp_uk < start_uk or timestamp_uk >= end_uk:
+                continue
+            day = timestamp_uk.date().isoformat()
+            by_day.setdefault(day, []).append((timestamp, float(row[1])))
 
-        for chunk in range(CHUNK_PROBE_LIMIT):
-            chunk_end_uk = now_uk - timedelta(days=chunk * CHUNK_PROBE_DAYS)
-            chunk_start_uk = chunk_end_uk - timedelta(days=CHUNK_PROBE_DAYS)
-            try:
-                async with self._session.get(
-                    f"{GLOWMARKT_API_BASE}/resource/{resource_id}/readings",
-                    headers=self._get_headers(),
-                    params={
-                        "from": chunk_start_uk.astimezone(timezone.utc).strftime(
-                            "%Y-%m-%dT%H:%M:%S"
-                        ),
-                        "to": chunk_end_uk.astimezone(timezone.utc).strftime(
-                            "%Y-%m-%dT%H:%M:%S"
-                        ),
-                        "period": "P1D",
-                        "offset": 0,
-                        "function": "sum",
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-            except ClientError as err:
-                _LOGGER.error("History probe failed for %s: %s", resource_id, err)
-                break
-
-            rows = data.get("data", []) if data.get("status") == "OK" else []
-            nonzero = [
-                row for row in rows if row[1] is not None and row[1] > 0
-            ]
-            if nonzero:
-                earliest = datetime.fromtimestamp(
-                    min(row[0] for row in nonzero),
-                    tz=UK_TZ,
-                ).replace(hour=0, minute=0, second=0, microsecond=0)
-                consecutive_empty = 0
-            else:
-                consecutive_empty += 1
-                if consecutive_empty >= 2:
-                    break
-
-        return earliest
+        readings: list[DailyReading] = []
+        for day in sorted(by_day):
+            intervals = sorted(by_day[day], key=lambda item: item[0])
+            readings.append(
+                DailyReading(
+                    day=day,
+                    value=round(sum(value for _, value in intervals), 3),
+                    intervals=intervals,
+                )
+            )
+        return readings
 
     async def get_available_daily_readings(
         self,
         resource_id: str,
     ) -> list[DailyReading]:
-        """Fetch all complete historical days for a resource, oldest first."""
+        """Fetch every complete historical day available for a resource."""
         await self._ensure_authenticated()
         start_uk = await self._find_data_start(resource_id)
         if start_uk is None:
@@ -302,18 +416,22 @@ class GlowmarktApiClient:
             second=0,
             microsecond=0,
         )
-        readings: list[DailyReading] = []
-        day_start_uk = start_uk
-        while day_start_uk < today_start_uk:
-            reading = await self._fetch_day_reading(
-                resource_id,
-                day_start_uk,
-                day_start_uk + timedelta(days=1),
+        readings_by_day: dict[str, DailyReading] = {}
+        chunk_start = start_uk
+        while chunk_start < today_start_uk:
+            chunk_end = min(
+                chunk_start + timedelta(days=HISTORY_INTERVAL_DAYS),
+                today_start_uk,
             )
-            if reading is not None:
-                readings.append(reading)
-            day_start_uk += timedelta(days=1)
-        return readings
+            for reading in await self._fetch_history_chunk(
+                resource_id,
+                chunk_start,
+                chunk_end,
+            ):
+                readings_by_day[reading.day] = reading
+            chunk_start = chunk_end
+
+        return [readings_by_day[day] for day in sorted(readings_by_day)]
 
     async def get_all_readings(self) -> dict[str, DailyReading | None]:
         if not self._resources:
