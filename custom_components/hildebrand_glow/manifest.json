@@ -1,13 +1,17 @@
 {
   "domain": "hildebrand_glow",
   "name": "Hildebrand Glow (Bright App)",
-  "codeowners": ["@xmcdanx"],
+  "codeowners": [
+    "@NJWILKS"
+  ],
   "config_flow": true,
-  "dependencies": ["recorder"],
-  "documentation": "https://github.com/xmcdanx/hildebrand-glow-ha",
+  "dependencies": [
+    "recorder"
+  ],
+  "documentation": "https://github.com/NJWILKS/hildebrand-glow-ha",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/xmcdanx/hildebrand-glow-ha/issues",
+  "issue_tracker": "https://github.com/NJWILKS/hildebrand-glow-ha/issues",
   "requirements": [],
-  "version": "1.0.0"
+  "version": "2.0.0"
 }
