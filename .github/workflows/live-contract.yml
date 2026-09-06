@@ -29,4 +29,5 @@ jobs:
         env:
           GLOWMARKT_USERNAME: ${{ secrets.GLOWMARKT_USERNAME }}
           GLOWMARKT_PASSWORD: ${{ secrets.GLOWMARKT_PASSWORD }}
+          PYTHONPATH: .
         run: pytest -p no:homeassistant -m live live_tests
