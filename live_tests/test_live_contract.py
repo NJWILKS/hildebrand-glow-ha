@@ -10,7 +10,10 @@ import aiohttp
 import pytest
 
 from custom_components.hildebrand_glow.api import UK_TZ, GlowmarktApiClient
-from custom_components.hildebrand_glow.const import CLASSIFIER_ELECTRICITY_CONSUMPTION
+from custom_components.hildebrand_glow.const import (
+    CLASSIFIER_ELECTRICITY_CONSUMPTION,
+    GLOWMARKT_API_BASE,
+)
 
 pytestmark = pytest.mark.live
 
@@ -50,6 +53,62 @@ def _timestamp_geometry(
     expected_epochs = set(range(start_epoch, end_epoch, 1800))
     actual_epochs = {int(timestamp.timestamp()) for timestamp, _ in intervals}
     return sorted(expected_epochs - actual_epochs), sorted(actual_epochs - expected_epochs)
+
+
+def _filter_local_day(
+    rows: list[list[object]],
+    start: datetime,
+    end: datetime,
+) -> list[tuple[datetime, float]]:
+    result: list[tuple[datetime, float]] = []
+    for row in rows:
+        if len(row) <= 1 or row[1] is None:
+            continue
+        timestamp = datetime.fromtimestamp(float(row[0]), tz=timezone.utc)
+        local_timestamp = timestamp.astimezone(UK_TZ)
+        if start <= local_timestamp < end:
+            result.append((timestamp, float(row[1])))
+    return result
+
+
+async def _diagnose_query_geometry(
+    client: GlowmarktApiClient,
+    resource_id: str,
+    start: datetime,
+    end: datetime,
+) -> str:
+    padded_rows = await client._request_readings(
+        resource_id,
+        start - timedelta(hours=1),
+        end,
+        "PT30M",
+    )
+    padded = _filter_local_day(padded_rows, start, end)
+    padded_missing, padded_extra = _timestamp_geometry(start, end, padded)
+
+    offset_minutes = -int(start.utcoffset().total_seconds() / 60)
+    local_params = {
+        "from": start.strftime("%Y-%m-%dT%H:%M:%S"),
+        "to": (end - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+        "period": "PT30M",
+        "offset": offset_minutes,
+        "function": "sum",
+        "nulls": 1,
+    }
+    local_payload = await client._get_json(
+        f"{GLOWMARKT_API_BASE}/resource/{resource_id}/readings",
+        params=local_params,
+    )
+    local_rows = local_payload.get("data", []) if isinstance(local_payload, dict) else []
+    local = _filter_local_day(local_rows, start, end)
+    local_missing, local_extra = _timestamp_geometry(start, end, local)
+
+    return (
+        f"padded_actual={len(padded)} padded_missing={padded_missing[:5]} "
+        f"padded_extra={padded_extra[:5]}; local_offset={offset_minutes} "
+        f"local_actual={len(local)} local_missing={local_missing[:5]} "
+        f"local_extra={local_extra[:5]}"
+    )
 
 
 async def _known_electricity_resource(
@@ -111,10 +170,16 @@ async def test_live_account_matches_known_electricity_export() -> None:
 
             if len(reading.intervals) != expected["intervals"]:
                 missing, extra = _timestamp_geometry(start, end, reading.intervals)
+                alternatives = await _diagnose_query_geometry(
+                    client,
+                    resource_id,
+                    start,
+                    end,
+                )
                 pytest.fail(
                     "Live contract: interval geometry mismatch for case "
                     f"{day}; expected={expected['intervals']} actual={len(reading.intervals)} "
-                    f"missing={missing[:5]} extra={extra[:5]}"
+                    f"missing={missing[:5]} extra={extra[:5]}; {alternatives}"
                 )
             if reading.value != expected["kwh"]:
                 pytest.fail(f"Live contract: daily total mismatch for case {day}")
