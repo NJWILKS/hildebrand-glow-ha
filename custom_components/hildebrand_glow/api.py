@@ -313,7 +313,7 @@ class GlowmarktApiClient:
         day_end_uk: datetime,
         days_back: int | None = None,
     ) -> DailyReading | None:
-        """Fetch one explicit UK-local day when the API has real data for it."""
+        """Fetch exactly one UK-local day, excluding any API end-boundary bucket."""
         _LOGGER.debug(
             "Fetching %s (%s) from %s to %s",
             resource_id,
@@ -327,14 +327,20 @@ class GlowmarktApiClient:
             day_end_uk,
             "PT30M",
         )
-        valid = [row for row in rows if len(row) > 1 and row[1] is not None]
-        if not valid:
+
+        intervals: list[tuple[datetime, float]] = []
+        for row in rows:
+            if len(row) <= 1 or row[1] is None:
+                continue
+            timestamp = datetime.fromtimestamp(row[0], tz=timezone.utc)
+            timestamp_uk = timestamp.astimezone(UK_TZ)
+            if timestamp_uk < day_start_uk or timestamp_uk >= day_end_uk:
+                continue
+            intervals.append((timestamp, float(row[1])))
+
+        if not intervals:
             return None
 
-        intervals = [
-            (datetime.fromtimestamp(row[0], tz=timezone.utc), float(row[1]))
-            for row in valid
-        ]
         return DailyReading(
             day=day_start_uk.date().isoformat(),
             value=round(sum(value for _, value in intervals), 3),
