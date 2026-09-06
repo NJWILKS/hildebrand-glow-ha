@@ -20,9 +20,14 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import DailyReading, GlowmarktApiClient, GlowmarktApiError, GlowmarktAuthError, UK_TZ
 from .const import (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
+    CLASSIFIER_ELECTRICITY_COST,
     CLASSIFIER_GAS_CONSUMPTION,
-    DEFAULT_SCAN_INTERVAL,
+    CLASSIFIER_GAS_COST,
+    DEFAULT_CONSUMPTION_INTERVAL,
+    DEFAULT_COST_INTERVAL,
     DOMAIN,
+    HISTORY_START_DELAY_SECONDS,
+    MIN_POLL_INTERVAL,
 )
 from .identity import sensor_unique_id, site_identity
 
@@ -30,6 +35,10 @@ _LOGGER = logging.getLogger(__name__)
 CUMULATIVE_CLASSIFIERS = (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_GAS_CONSUMPTION,
+)
+API_COST_CLASSIFIERS = (
+    CLASSIFIER_ELECTRICITY_COST,
+    CLASSIFIER_GAS_COST,
 )
 CUMULATIVE_STORAGE_VERSION = 1
 
@@ -44,12 +53,22 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         tariff_config: dict[str, float],
         virtual_entity_id: str | None = None,
         entry_id: str = "default",
+        consumption_interval_minutes: int = DEFAULT_CONSUMPTION_INTERVAL,
+        cost_interval_minutes: int = DEFAULT_COST_INTERVAL,
     ) -> None:
+        self._consumption_interval_minutes = max(
+            MIN_POLL_INTERVAL,
+            int(consumption_interval_minutes),
+        )
+        self._cost_interval_minutes = max(
+            MIN_POLL_INTERVAL,
+            int(cost_interval_minutes),
+        )
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=DEFAULT_SCAN_INTERVAL,
+            update_interval=timedelta(minutes=self._consumption_interval_minutes),
         )
         self.api_client = api_client
         self.tariff_config = tariff_config
@@ -58,6 +77,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._site_id = site_identity(virtual_entity_id, entry_id)
         self._resources: dict[str, dict[str, Any]] = {}
         self._last_readings: dict[str, DailyReading] = {}
+        self._last_cost_refresh_at: datetime | None = None
         self._store = Store(
             hass,
             CUMULATIVE_STORAGE_VERSION,
@@ -66,10 +86,21 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._cumulative: dict[str, Any] | None = None
         self._cumulative_lock = asyncio.Lock()
         self._backfill_started = False
+        self._history_start_scheduled = False
+
+    def _resource_id_for(self, classifier: str) -> str | None:
+        resource = self._resources.get(classifier)
+        if resource is None:
+            return None
+        return resource.get("resource_id")
 
     def _entity_id_for(self, classifier: str) -> str | None:
         registry = er.async_get(self.hass)
-        unique_id = sensor_unique_id(self._site_id, classifier)
+        unique_id = sensor_unique_id(
+            self._site_id,
+            classifier,
+            self._resource_id_for(classifier),
+        )
         return registry.async_get_entity_id("sensor", DOMAIN, unique_id)
 
     @staticmethod
@@ -161,6 +192,26 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name=f"{DOMAIN} history backfill",
         )
 
+    async def _async_delayed_history_start(self, delay: int) -> None:
+        try:
+            await asyncio.sleep(delay)
+            self.start_history_backfill()
+        finally:
+            self._history_start_scheduled = False
+
+    def schedule_history_backfill(
+        self,
+        delay: int = HISTORY_START_DELAY_SECONDS,
+    ) -> None:
+        """Stagger history work so setup/entity registration can finish first."""
+        if self._history_start_scheduled or self._backfill_started:
+            return
+        self._history_start_scheduled = True
+        self.hass.async_create_task(
+            self._async_delayed_history_start(delay),
+            name=f"{DOMAIN} delayed history start",
+        )
+
     async def _async_backfill_history(self) -> None:
         """Import all real hourly consumption history without blocking startup."""
         completed = False
@@ -203,8 +254,6 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         }
                     cumulative[classifier] = entry
 
-                    # Replace state-compiler artefacts for the current UK day
-                    # with a flat corrected baseline until that day completes.
                     today_start_uk = datetime.now(UK_TZ).replace(
                         hour=0,
                         minute=0,
@@ -250,11 +299,19 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         for classifier, readings in history.items()
                     ),
                 )
-        except Exception:  # Background work must not create an unhandled task error.
+        except Exception:
             _LOGGER.exception("Glowmarkt history backfill failed")
         finally:
             if not completed:
                 self._backfill_started = False
+
+    def _cost_refresh_due(self, now: datetime) -> bool:
+        if self._last_cost_refresh_at is None:
+            return True
+        return (
+            now - self._last_cost_refresh_at
+            >= timedelta(minutes=self._cost_interval_minutes)
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:
@@ -263,14 +320,33 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._virtual_entity_id
                 )
 
-            readings = await self.api_client.get_all_readings()
-            for classifier, reading in readings.items():
+            consumption_readings = await self.api_client.get_readings(
+                set(CUMULATIVE_CLASSIFIERS)
+            )
+            for classifier, reading in consumption_readings.items():
                 if reading is not None:
                     self._last_readings[classifier] = reading
 
+            now = datetime.now(timezone.utc)
+            if self._cost_refresh_due(now):
+                try:
+                    cost_readings = await self.api_client.get_readings(
+                        set(API_COST_CLASSIFIERS)
+                    )
+                except GlowmarktApiError as err:
+                    _LOGGER.warning(
+                        "Glowmarkt API-cost refresh failed; preserving last values: %s",
+                        err,
+                    )
+                else:
+                    for classifier, reading in cost_readings.items():
+                        if reading is not None:
+                            self._last_readings[classifier] = reading
+                    self._last_cost_refresh_at = now
+
             merged = {
                 classifier: self._last_readings.get(classifier)
-                for classifier in readings
+                for classifier in self._resources
             }
             values = {
                 classifier: reading.value if reading is not None else None
@@ -331,7 +407,34 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def resources(self) -> dict[str, dict[str, Any]]:
         return self._resources
 
+    @property
+    def consumption_interval_minutes(self) -> int:
+        return self._consumption_interval_minutes
+
+    @property
+    def cost_interval_minutes(self) -> int:
+        return self._cost_interval_minutes
+
+    def update_settings(
+        self,
+        tariff_config: dict[str, float],
+        consumption_interval_minutes: int,
+        cost_interval_minutes: int,
+    ) -> None:
+        """Apply options without requiring a config-entry recreation."""
+        self.tariff_config = tariff_config
+        self._consumption_interval_minutes = max(
+            MIN_POLL_INTERVAL,
+            int(consumption_interval_minutes),
+        )
+        self._cost_interval_minutes = max(
+            MIN_POLL_INTERVAL,
+            int(cost_interval_minutes),
+        )
+        self.update_interval = timedelta(minutes=self._consumption_interval_minutes)
+
     def update_tariff_config(self, tariff_config: dict[str, float]) -> None:
+        """Backward-compatible helper used by older callers/tests."""
         self.tariff_config = tariff_config
 
     def clear_daily_cache(self) -> None:
