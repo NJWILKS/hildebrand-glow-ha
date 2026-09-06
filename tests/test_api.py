@@ -98,3 +98,28 @@ async def test_discover_resources_for_single_virtual_entity() -> None:
 
     assert resources["electricity.consumption"]["resource_id"] == "electricity-resource"
     assert resources["electricity.consumption"]["base_unit"] == "kWh"
+
+
+@pytest.mark.asyncio
+async def test_discover_resources_can_target_selected_virtual_entity() -> None:
+    session = FakeSession(
+        [
+            {
+                "resources": [
+                    {
+                        "resourceId": "site-2-electricity",
+                        "classifier": "electricity.consumption",
+                        "name": "Electricity consumption",
+                        "baseUnit": "kWh",
+                    }
+                ]
+            }
+        ]
+    )
+    client = _authenticated_client(session)
+
+    resources = await client.discover_resources("site-2")
+
+    assert len(session.get_calls) == 1
+    assert "/virtualentity/site-2/resources" in session.get_calls[0][0]
+    assert resources["electricity.consumption"]["resource_id"] == "site-2-electricity"
