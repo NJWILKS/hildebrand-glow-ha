@@ -61,7 +61,8 @@ async def _known_electricity_resource(
 
 
 @pytest.mark.asyncio
-async def test_live_account_matches_known_electricity_export() -> None:
+async def test_live_account_matches_known_electricity_export(socket_enabled) -> None:
+    """Verify the real account only in the explicitly network-enabled live tier."""
     oracle = _oracle()
     username = os.environ["GLOWMARKT_USERNAME"]
     password = os.environ["GLOWMARKT_PASSWORD"]
