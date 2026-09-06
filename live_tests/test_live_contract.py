@@ -14,7 +14,12 @@ from custom_components.hildebrand_glow.const import CLASSIFIER_ELECTRICITY_CONSU
 
 pytestmark = pytest.mark.live
 
-ORACLE = Path(__file__).parents[1] / "fixtures" / "electricity_export_oracle.json"
+ORACLE = (
+    Path(__file__).parents[1]
+    / "tests"
+    / "fixtures"
+    / "electricity_export_oracle.json"
+)
 IMMUTABLE_TEST_DAYS = (
     "2025-07-30",
     "2025-10-26",
@@ -61,8 +66,8 @@ async def _known_electricity_resource(
 
 
 @pytest.mark.asyncio
-async def test_live_account_matches_known_electricity_export(socket_enabled) -> None:
-    """Verify the real account only in the explicitly network-enabled live tier."""
+async def test_live_account_matches_known_electricity_export() -> None:
+    """Compare protected live API data with the contributed immutable export."""
     oracle = _oracle()
     username = os.environ["GLOWMARKT_USERNAME"]
     password = os.environ["GLOWMARKT_PASSWORD"]
