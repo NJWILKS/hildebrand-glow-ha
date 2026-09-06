@@ -23,3 +23,19 @@ def test_sensor_unique_id_is_stable_for_same_site() -> None:
     assert sensor_unique_id("site-1", "electricity.consumption") == (
         "site-1_electricity.consumption"
     )
+
+
+def test_sensor_unique_id_prefers_glow_resource_id() -> None:
+    first = sensor_unique_id(
+        "site-1",
+        "electricity.consumption",
+        "resource-123",
+    )
+    second = sensor_unique_id(
+        "site-2",
+        "electricity.consumption",
+        "resource-123",
+    )
+
+    assert first == "resource-123_electricity.consumption"
+    assert second == first

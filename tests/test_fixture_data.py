@@ -16,6 +16,12 @@ def test_export_oracle_captures_full_source_dataset() -> None:
     assert oracle["source_rows"] == 19346
     assert oracle["source_total_kwh"] == 7646.171
     assert oracle["zero_readings"] == 1
+    assert oracle["source_sha256"] == (
+        "e70bb156e644b0d340694e111715f82d14979834bebd100f29a6f6dd6760ebf4"
+    )
+    assert oracle["canonical_intervals_sha256"] == (
+        "47da63e3c09373fbbb5d8e58300ba6d618b664dcac3e3de55e1f45e497ce347b"
+    )
     assert oracle["first_epoch_utc"] == 1753830000
     assert oracle["last_epoch_utc"] == 1788651000
     assert oracle["uk_local_days"] == 404
@@ -26,17 +32,16 @@ def test_export_oracle_captures_full_source_dataset() -> None:
 def test_export_oracle_covers_both_uk_dst_transition_days() -> None:
     known_days = _load_oracle()["known_days"]
 
-    assert known_days["2025-10-26"]["intervals"] == 50
-    assert known_days["2025-10-26"]["kwh"] == 20.989
-    assert known_days["2025-10-26"]["sha256"] == (
-        "fa44cd85f0cc7c1fcb61fe45dc0964040d8099221c544ca716227c146e43d219"
-    )
-
-    assert known_days["2026-03-29"]["intervals"] == 46
-    assert known_days["2026-03-29"]["kwh"] == 24.096
-    assert known_days["2026-03-29"]["sha256"] == (
-        "5b04883dc2df239347966b5375fc3703d935be801f16551c5584b0781d05c3b8"
-    )
+    assert known_days["2025-10-26"] == {
+        "intervals": 50,
+        "kwh": 20.989,
+        "sha256": "31e5360a5e1c06c46f31558fc43fa8079edeef41af72afb7952799eaa3e548da",
+    }
+    assert known_days["2026-03-29"] == {
+        "intervals": 46,
+        "kwh": 24.096,
+        "sha256": "eaf06c60b7e981638ae375573cb830d8678901839b61a9d247cd1f313d95e694",
+    }
 
 
 def test_export_oracle_has_known_boundary_day_totals() -> None:
