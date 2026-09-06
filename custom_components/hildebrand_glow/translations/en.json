@@ -6,13 +6,18 @@
         "description": "Enter your Hildebrand Bright app credentials.",
         "data": {"username": "Email Address", "password": "Password"}
       },
+      "select_entity": {
+        "title": "Select Your Meter",
+        "description": "Select the Bright meter site you want this Home Assistant integration to monitor.",
+        "data": {"virtual_entity_id": "Location"}
+      },
       "tariff": {
         "title": "Energy Tariff Configuration",
         "description": "Enter your energy tariff rates. These can be changed later.",
         "data": {"electricity_rate": "Electricity Rate (£/kWh)", "electricity_standing_charge": "Electricity Standing Charge (£/day)", "gas_rate": "Gas Rate (£/kWh)", "gas_standing_charge": "Gas Standing Charge (£/day)"}
       }
     },
-    "error": {"invalid_auth": "Invalid username or password.", "cannot_connect": "Unable to connect to the Glowmarkt API.", "no_resources": "No smart meter resources found.", "unknown": "An unexpected error occurred."},
+    "error": {"invalid_auth": "Invalid username or password.", "cannot_connect": "Unable to connect to the Glowmarkt API.", "no_resources": "No smart meter resources found for this location.", "unknown": "An unexpected error occurred."},
     "abort": {"already_configured": "This account is already configured."}
   },
   "options": {

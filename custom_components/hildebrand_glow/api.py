@@ -9,8 +9,6 @@ from aiohttp import ClientError, ClientResponseError
 from .const import GLOWMARKT_API_BASE, GLOWMARKT_APP_ID
 
 _LOGGER = logging.getLogger(__name__)
-
-# UK timezone for proper day boundaries
 UK_TZ = ZoneInfo("Europe/London")
 
 class GlowmarktAuthError(Exception):
@@ -43,10 +41,8 @@ class GlowmarktApiClient:
                 if data.get("valid"):
                     self._token = data["token"]
                     self._token_expiry = datetime.now() + timedelta(days=6)
-                    _LOGGER.debug("Authentication successful, token expires in 6 days")
                     return True
-                else:
-                    raise GlowmarktAuthError("Authentication failed: invalid response")
+                raise GlowmarktAuthError("Authentication failed: invalid response")
         except ClientResponseError as err:
             raise GlowmarktAuthError(f"Authentication failed: {err}") from err
         except ClientError as err:
@@ -69,28 +65,34 @@ class GlowmarktApiClient:
         except ClientError as err:
             raise GlowmarktApiError(f"Failed to get virtual entities: {err}") from err
 
-    async def discover_resources(self) -> dict[str, dict[str, Any]]:
+    async def discover_resources(self, virtual_entity_id: str | None = None) -> dict[str, dict[str, Any]]:
+        """Discover resources for one selected virtual entity, or all entities."""
         await self._ensure_authenticated()
-        virtual_entities = await self.get_virtual_entities()
-        if not virtual_entities:
-            return {}
+        if virtual_entity_id:
+            self._virtual_entity_id = virtual_entity_id
+            ve_ids = [virtual_entity_id]
+        else:
+            virtual_entities = await self.get_virtual_entities()
+            if not virtual_entities:
+                return {}
+            ve_ids = [ve.get("veId") for ve in virtual_entities if ve.get("veId")]
+
         self._resources = {}
-        for ve in virtual_entities:
-            ve_id = ve.get("veId")
-            if not ve_id:
-                continue
-            self._virtual_entity_id = ve_id
+        for ve_id in ve_ids:
             try:
                 async with self._session.get(f"{GLOWMARKT_API_BASE}/virtualentity/{ve_id}/resources", headers=self._get_headers()) as response:
                     response.raise_for_status()
                     data = await response.json()
-                    resources = data.get("resources", [])
-                    for resource in resources:
+                    for resource in data.get("resources", []):
                         resource_id = resource.get("resourceId")
                         classifier = resource.get("classifier")
                         if resource_id and classifier:
-                            self._resources[classifier] = {"resource_id": resource_id, "name": resource.get("name", classifier), "classifier": classifier, "base_unit": resource.get("baseUnit", "")}
-                            _LOGGER.debug("Found resource: %s (%s)", classifier, resource_id)
+                            self._resources[classifier] = {
+                                "resource_id": resource_id,
+                                "name": resource.get("name", classifier),
+                                "classifier": classifier,
+                                "base_unit": resource.get("baseUnit", ""),
+                            }
             except ClientError as err:
                 _LOGGER.error("Failed to get resources for %s: %s", ve_id, err)
         return self._resources
@@ -98,76 +100,36 @@ class GlowmarktApiClient:
     async def get_daily_reading(self, resource_id: str) -> float | None:
         """Get daily reading by fetching 30-min intervals and summing them."""
         await self._ensure_authenticated()
-        
-        # Use UK timezone for proper day boundaries
         now_uk = datetime.now(UK_TZ)
         today_start_uk = now_uk.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # Convert to UTC for API call (API expects UTC)
         today_start_utc = today_start_uk.astimezone(timezone.utc)
         now_utc = now_uk.astimezone(timezone.utc)
-        
-        _LOGGER.debug(
-            "Fetching readings for %s from %s to %s (UK: %s to %s)",
-            resource_id,
-            today_start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-            now_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-            today_start_uk.strftime("%Y-%m-%d %H:%M"),
-            now_uk.strftime("%H:%M")
-        )
-        
         try:
-            # Fetch 30-minute interval data for today and sum it
             params = {
                 "from": today_start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
                 "to": now_utc.strftime("%Y-%m-%dT%H:%M:%S"),
                 "period": "PT30M",
                 "offset": 0,
-                "function": "sum"
+                "function": "sum",
             }
-            _LOGGER.debug("API params: %s", params)
-            
             async with self._session.get(
                 f"{GLOWMARKT_API_BASE}/resource/{resource_id}/readings",
                 headers=self._get_headers(),
-                params=params
+                params=params,
             ) as response:
                 response.raise_for_status()
                 data = await response.json()
-                
-                _LOGGER.debug("API response status: %s, data points: %s", 
-                    data.get("status"), 
-                    len(data.get("data", [])) if data.get("data") else 0
-                )
-                
                 if data.get("status") == "OK" and data.get("data"):
-                    readings = data["data"]
-                    # Log each reading for debugging
-                    for reading in readings[-5:]:  # Log last 5 readings
-                        ts = datetime.fromtimestamp(reading[0], tz=UK_TZ).strftime("%H:%M")
-                        val = reading[1]
-                        _LOGGER.debug("  %s: %s kWh", ts, val)
-                    
-                    # Sum all the 30-minute readings
-                    total = sum(reading[1] for reading in readings if reading[1] is not None)
-                    _LOGGER.info("Resource %s: summed %d readings = %.3f kWh", 
-                        resource_id, len(readings), total)
+                    total = sum(reading[1] for reading in data["data"] if reading[1] is not None)
                     return round(total, 3)
-                else:
-                    _LOGGER.warning("No data returned for %s. Status: %s, Response: %s", 
-                        resource_id, data.get("status"), data)
-                    return None  # Return None instead of 0 when no data
-                    
-        except ClientResponseError as err:
-            _LOGGER.error("API error for %s: %s %s", resource_id, err.status, err.message)
-            return None
-        except ClientError as err:
+                return None
+        except (ClientResponseError, ClientError) as err:
             _LOGGER.error("Failed to get reading for %s: %s", resource_id, err)
             return None
 
     async def get_all_readings(self) -> dict[str, float | None]:
         if not self._resources:
-            await self.discover_resources()
+            await self.discover_resources(self._virtual_entity_id)
         readings = {}
         for classifier, resource in self._resources.items():
             readings[classifier] = await self.get_daily_reading(resource["resource_id"])
