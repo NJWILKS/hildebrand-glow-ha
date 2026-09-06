@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not live'"
+asyncio_mode = "auto"
+markers = [
+  "live: tests that call the real Glowmarkt API and require protected credentials",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
