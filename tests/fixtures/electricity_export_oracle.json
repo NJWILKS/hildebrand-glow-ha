@@ -1,0 +1,15 @@
+{
+  "source_rows": 19346,
+  "source_total_kwh": 7646.171,
+  "zero_readings": 1,
+  "uk_local_start": "2025-07-30T00:00:00+01:00",
+  "uk_local_end": "2026-09-06T00:30:00+01:00",
+  "uk_local_days": 404,
+  "known_days": {
+    "2025-07-30": {"intervals": 48, "kwh": 22.026},
+    "2025-10-26": {"intervals": 50, "kwh": 20.989},
+    "2026-03-29": {"intervals": 46, "kwh": 24.096},
+    "2026-09-05": {"intervals": 48, "kwh": 11.373},
+    "2026-09-06": {"intervals": 2, "kwh": 0.307}
+  }
+}
