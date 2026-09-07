@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from custom_components.hildebrand_glow.cost_history import (
+    _effective_key,
+    build_component_statistics,
+)
+from custom_components.hildebrand_glow.costing import CostBreakdown
+
+
+def test_cost_component_statistics_are_daily_stackable_states() -> None:
+    history = [
+        CostBreakdown(
+            day="2025-10-26",
+            total_pence=347.2,
+            usage_pence=300.0,
+            standing_charge_pence=47.2,
+            standing_charge_status="applied",
+            complete_day=True,
+        ),
+        CostBreakdown(
+            day="2025-10-27",
+            total_pence=250.0,
+            usage_pence=250.0,
+            standing_charge_pence=0.0,
+            standing_charge_status="not_applied",
+            complete_day=True,
+        ),
+    ]
+
+    usage, standing = build_component_statistics(history)
+
+    assert [item.state for item in usage] == [3.0, 2.5]
+    assert [item.sum for item in usage] == [3.0, 5.5]
+    assert [item.state for item in standing] == [0.47, 0.0]
+    assert [item.sum for item in standing] == [0.47, 0.47]
+    assert usage[0].start == datetime(2025, 10, 25, 23, 0, tzinfo=timezone.utc)
+
+
+def test_unknown_standing_charge_does_not_invent_historical_value() -> None:
+    history = [
+        CostBreakdown(
+            day="2026-03-29",
+            total_pence=300.0,
+            usage_pence=250.0,
+            standing_charge_pence=None,
+            standing_charge_status="unknown",
+            complete_day=True,
+        )
+    ]
+
+    usage, standing = build_component_statistics(history)
+
+    assert len(usage) == 1
+    assert usage[0].start == datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)
+    assert standing == []
+
+
+def test_tariff_history_sort_key_prefers_effective_date_then_from() -> None:
+    rows = [
+        {"from": "2026-07-01 00:00:00"},
+        {"effectiveDate": "2026-04-01 00:00:00"},
+        {"effectiveDate": "2026-10-01 00:00:00"},
+    ]
+
+    assert sorted(rows, key=_effective_key) == [rows[1], rows[0], rows[2]]
