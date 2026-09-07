@@ -20,7 +20,7 @@ def test_options_flow_factory_does_not_assign_read_only_config_entry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_options_flow_exposes_reset_history_action(hass) -> None:
+async def test_options_flow_exposes_reset_history_action(hass, recorder_mock) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_VIRTUAL_ENTITY: "site-123"},
@@ -35,7 +35,10 @@ async def test_options_flow_exposes_reset_history_action(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reset_history_requires_confirmation_and_runs_reset(hass) -> None:
+async def test_reset_history_requires_confirmation_and_runs_reset(
+    hass,
+    recorder_mock,
+) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_VIRTUAL_ENTITY: "site-123"},
