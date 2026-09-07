@@ -11,6 +11,7 @@ from .costing import CostBreakdown
 
 MIN_INFERENCE_SAMPLES = 3
 CURRENT_CALIBRATION_MIN_TOLERANCE_PENCE = 5.0
+PENCE_PRECISION = 6
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,11 @@ class TariffPeriod:
     residual_mad_pence: float | None = None
     configured_standing_delta_pence: float | None = None
     configured_unit_rate_delta_pence: float | None = None
+
+
+def _round_pence(value: float) -> float:
+    """Normalise tariff arithmetic without discarding sub-penny precision."""
+    return round(float(value), PENCE_PRECISION)
 
 
 def _number(value: Any) -> float | None:
@@ -78,6 +84,7 @@ def _unique_numbers(values: list[Any]) -> list[float]:
         parsed = _number(value)
         if parsed is None:
             continue
+        parsed = _round_pence(parsed)
         if not any(abs(parsed - existing) < 1e-9 for existing in result):
             result.append(parsed)
     return result
@@ -96,7 +103,7 @@ def _tariff_values(item: dict[str, Any]) -> tuple[float | None, float | None, st
     _walk_plan(item.get("plan", item), found)
 
     standing_values = _unique_numbers(found["standing"] + found["standingCharge"])
-    standing = median(standing_values) if standing_values else None
+    standing = _round_pence(median(standing_values)) if standing_values else None
 
     rate_values = _unique_numbers(found["rate"] + found["tourate"])
     has_dynamic = any(value not in (None, "", False) for value in found["dynamic"])
@@ -173,7 +180,9 @@ def _period_residuals(
         day = date.fromisoformat(breakdown.day)
         if not _contains(period, day):
             continue
-        residual = float(breakdown.total_pence) - float(breakdown.usage_pence)
+        residual = _round_pence(
+            float(breakdown.total_pence) - float(breakdown.usage_pence)
+        )
         if residual > 0:
             residuals.append(residual)
     return residuals
@@ -226,12 +235,12 @@ def derive_tariff_periods(
         )
 
     configured_standing_pence = (
-        float(configured_standing_gbp) * 100.0
+        _round_pence(float(configured_standing_gbp) * 100.0)
         if configured_standing_gbp is not None
         else None
     )
     configured_rate_pence = (
-        float(configured_rate_gbp_per_kwh) * 100.0
+        _round_pence(float(configured_rate_gbp_per_kwh) * 100.0)
         if configured_rate_gbp_per_kwh is not None
         else None
     )
@@ -239,20 +248,32 @@ def derive_tariff_periods(
     resolved: list[TariffPeriod] = []
     for index, period in enumerate(periods):
         residuals = _period_residuals(history, period)
-        residual_median = median(residuals) if residuals else None
+        residual_median = (
+            _round_pence(median(residuals)) if residuals else None
+        )
         residual_mad = (
-            median([abs(value - residual_median) for value in residuals])
+            _round_pence(
+                median([abs(value - residual_median) for value in residuals])
+            )
             if residual_median is not None
             else None
         )
 
-        standing = period.standing_pence
+        standing = (
+            _round_pence(period.standing_pence)
+            if period.standing_pence is not None
+            else None
+        )
         standing_source = period.standing_source
         if standing is None and len(residuals) >= MIN_INFERENCE_SAMPLES:
-            standing = float(residual_median)
+            standing = residual_median
             standing_source = "inferred_residual_median"
 
-        unit_rate = period.unit_rate_pence_per_kwh
+        unit_rate = (
+            _round_pence(period.unit_rate_pence_per_kwh)
+            if period.unit_rate_pence_per_kwh is not None
+            else None
+        )
         unit_rate_source = period.unit_rate_source
         is_current = index == len(periods) - 1 and period.effective_to is None
 
@@ -260,7 +281,7 @@ def derive_tariff_periods(
         rate_delta = None
         if is_current and configured_standing_pence is not None:
             if standing is not None:
-                standing_delta = standing - configured_standing_pence
+                standing_delta = _round_pence(standing - configured_standing_pence)
             if period.standing_pence is None:
                 if standing is None:
                     standing = configured_standing_pence
@@ -279,7 +300,7 @@ def derive_tariff_periods(
 
         if is_current and configured_rate_pence is not None:
             if unit_rate is not None:
-                rate_delta = unit_rate - configured_rate_pence
+                rate_delta = _round_pence(unit_rate - configured_rate_pence)
             elif period.rate_kind == "unknown":
                 unit_rate = configured_rate_pence
                 unit_rate_source = "configured_current_fallback"
@@ -293,12 +314,8 @@ def derive_tariff_periods(
                 unit_rate_pence_per_kwh=unit_rate,
                 unit_rate_source=unit_rate_source,
                 sample_days=len(residuals),
-                residual_median_pence=(
-                    float(residual_median) if residual_median is not None else None
-                ),
-                residual_mad_pence=(
-                    float(residual_mad) if residual_mad is not None else None
-                ),
+                residual_median_pence=residual_median,
+                residual_mad_pence=residual_mad,
                 configured_standing_delta_pence=standing_delta,
                 configured_unit_rate_delta_pence=rate_delta,
             )
@@ -323,11 +340,11 @@ def normalise_cost_history(
             normalised.append(breakdown)
             continue
 
-        standing = float(period.standing_pence)
+        standing = _round_pence(period.standing_pence)
         normalised.append(
             replace(
                 breakdown,
-                usage_pence=float(breakdown.total_pence) - standing,
+                usage_pence=_round_pence(float(breakdown.total_pence) - standing),
                 standing_charge_pence=standing,
                 standing_charge_status=period.standing_source,
             )
