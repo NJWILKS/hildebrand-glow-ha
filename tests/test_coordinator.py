@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -59,12 +59,6 @@ class FakeApi:
                 CLASSIFIER_GAS_CONSUMPTION: FakeReading(
                     "2026-09-05", 20.0, []
                 ),
-                CLASSIFIER_ELECTRICITY_COST: FakeReading(
-                    "2026-09-05", 250.0, []
-                ),
-                CLASSIFIER_GAS_COST: FakeReading(
-                    "2026-09-05", 175.0, []
-                ),
             }
             if classifiers is None:
                 return all_readings
@@ -74,7 +68,23 @@ class FakeApi:
                 if classifier in classifiers
             }
 
+        async def request_readings(
+            resource_id: str,
+            start: datetime,
+            end: datetime,
+            period: str,
+        ):
+            timestamp = int(start.astimezone(timezone.utc).timestamp())
+            if resource_id == "electricity-cost-resource":
+                value = 250.0 if period == "PT30M" else 300.0
+            elif resource_id == "gas-cost-resource":
+                value = 140.0 if period == "PT30M" else 170.0
+            else:
+                return []
+            return [[timestamp, value]]
+
         self.get_readings = AsyncMock(side_effect=get_readings)
+        self._request_readings = AsyncMock(side_effect=request_readings)
         self.get_available_readings = AsyncMock(return_value={})
 
 
@@ -106,7 +116,33 @@ def _make_coordinator(
 
 
 @pytest.mark.asyncio
-async def test_coordinator_calculates_configured_daily_costs(hass) -> None:
+async def test_partial_day_uses_api_cost_without_standing_charge(hass, freezer) -> None:
+    freezer.move_to("2026-09-07 12:00:00+01:00")
+    api = FakeApi()
+    coordinator = _make_coordinator(hass, api)
+
+    data = await coordinator._async_update_data()
+
+    assert data["costs"]["electricity"] == 2.50
+    assert data["costs"]["gas"] == 1.40
+    assert data["costs"]["total"] == 3.90
+    assert data["costs"]["electricity_standing_charge"] == 0.0
+    assert data["costs"]["gas_standing_charge"] == 0.0
+    assert data["costs"]["standing_charges_total"] == 0.0
+    assert data["readings"][CLASSIFIER_ELECTRICITY_COST] == 250.0
+    assert data["readings"][CLASSIFIER_GAS_COST] == 140.0
+    assert data["cost_diagnostics"]["electricity"] == {
+        "source": "glow_api",
+        "api_day": "2026-09-07",
+        "complete_day": False,
+        "usage_cost_gbp": 2.5,
+        "standing_charge_status": "not_applied",
+    }
+
+
+@pytest.mark.asyncio
+async def test_completed_day_derives_standing_from_p1d_minus_pt30m(hass, freezer) -> None:
+    freezer.move_to("2026-09-07 00:00:00+01:00")
     api = FakeApi()
     coordinator = _make_coordinator(hass, api)
 
@@ -115,13 +151,49 @@ async def test_coordinator_calculates_configured_daily_costs(hass) -> None:
     assert data["costs"]["electricity"] == 3.00
     assert data["costs"]["gas"] == 1.70
     assert data["costs"]["total"] == 4.70
+    assert data["costs"]["electricity_standing_charge"] == 0.50
+    assert data["costs"]["gas_standing_charge"] == 0.30
     assert data["costs"]["standing_charges_total"] == 0.80
-    assert data["readings"][CLASSIFIER_ELECTRICITY_COST] == 250.0
-    assert data["readings"][CLASSIFIER_GAS_COST] == 175.0
+    assert data["cost_diagnostics"]["electricity"]["standing_charge_status"] == "applied"
+    periods = [call.args[3] for call in api._request_readings.await_args_list]
+    assert periods == ["PT30M", "P1D", "PT30M", "P1D"]
 
 
 @pytest.mark.asyncio
-async def test_coordinator_keeps_last_good_value_when_api_returns_none(hass) -> None:
+async def test_api_cost_failure_falls_back_without_taking_consumption_offline(hass) -> None:
+    api = FakeApi()
+    coordinator = _make_coordinator(hass, api)
+    api._request_readings.side_effect = GlowmarktApiError("rate limited")
+
+    data = await coordinator._async_update_data()
+
+    assert data["cumulative_readings"][CLASSIFIER_ELECTRICITY_CONSUMPTION] == 10.0
+    assert data["cumulative_readings"][CLASSIFIER_GAS_CONSUMPTION] == 20.0
+    assert data["costs"]["electricity"] == 3.00
+    assert data["costs"]["gas"] == 1.70
+    assert data["costs"]["standing_charges_total"] == 0.80
+    assert data["cost_diagnostics"]["electricity"]["source"] == "configured_fallback"
+
+
+@pytest.mark.asyncio
+async def test_electricity_only_site_does_not_add_gas_standing_charge(hass, freezer) -> None:
+    freezer.move_to("2026-09-07 00:00:00+01:00")
+    api = FakeApi()
+    api.discover_resources.return_value = {
+        CLASSIFIER_ELECTRICITY_CONSUMPTION: {"resource_id": "electricity-resource"},
+        CLASSIFIER_ELECTRICITY_COST: {"resource_id": "electricity-cost-resource"},
+    }
+    coordinator = _make_coordinator(hass, api)
+
+    data = await coordinator._async_update_data()
+
+    assert data["costs"]["electricity_standing_charge"] == 0.50
+    assert "gas_standing_charge" not in data["costs"]
+    assert data["costs"]["standing_charges_total"] == 0.50
+
+
+@pytest.mark.asyncio
+async def test_coordinator_keeps_last_good_value_when_consumption_returns_none(hass) -> None:
     api = FakeApi()
     coordinator = _make_coordinator(hass, api)
 
@@ -213,6 +285,7 @@ async def test_api_cost_resources_refresh_less_often_than_consumption(hass) -> N
     )
 
     await coordinator._async_update_data()
+    first_cost_calls = api._request_readings.await_count
     await coordinator._async_update_data()
 
     requested = [call.args[0] for call in api.get_readings.await_args_list]
@@ -220,41 +293,8 @@ async def test_api_cost_resources_refresh_less_often_than_consumption(hass) -> N
         CLASSIFIER_ELECTRICITY_CONSUMPTION,
         CLASSIFIER_GAS_CONSUMPTION,
     }
-    cost_set = {
-        CLASSIFIER_ELECTRICITY_COST,
-        CLASSIFIER_GAS_COST,
-    }
-
     assert requested.count(consumption_set) == 2
-    assert requested.count(cost_set) == 1
-
-
-@pytest.mark.asyncio
-async def test_cost_api_failure_does_not_take_consumption_offline(hass) -> None:
-    api = FakeApi()
-    coordinator = _make_coordinator(hass, api)
-
-    async def selective_failure(classifiers: set[str] | None = None):
-        if classifiers == {
-            CLASSIFIER_ELECTRICITY_COST,
-            CLASSIFIER_GAS_COST,
-        }:
-            raise GlowmarktApiError("rate limited")
-        return {
-            CLASSIFIER_ELECTRICITY_CONSUMPTION: FakeReading(
-                "2026-09-05", 10.0, []
-            ),
-            CLASSIFIER_GAS_CONSUMPTION: FakeReading(
-                "2026-09-05", 20.0, []
-            ),
-        }
-
-    api.get_readings.side_effect = selective_failure
-
-    data = await coordinator._async_update_data()
-
-    assert data["cumulative_readings"][CLASSIFIER_ELECTRICITY_CONSUMPTION] == 10.0
-    assert data["cumulative_readings"][CLASSIFIER_GAS_CONSUMPTION] == 20.0
+    assert api._request_readings.await_count == first_cost_calls
 
 
 def test_update_settings_enforces_minimum_poll_floor(hass) -> None:

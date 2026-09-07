@@ -13,7 +13,7 @@ Every pull request runs:
 - Hassfest;
 - HACS validation.
 
-The standard test suite covers API parsing, config flow, multi-site selection, sensor metadata, identity, coordinator behaviour, cumulative/restart safety, DST handling, history chunking, backoff and failure behaviour.
+The standard test suite covers API parsing, config flow, multi-site selection, sensor metadata, identity, coordinator behaviour, cumulative/restart safety, DST handling, history chunking, cost aggregation semantics, tariff ordering, backoff and failure behaviour.
 
 Run locally with:
 
@@ -27,7 +27,7 @@ ruff check .
 
 A behavioural bug fix should include a regression test that describes the failure independently of the implementation.
 
-For historical energy changes, tests should explicitly consider:
+For historical energy and cost changes, tests should explicitly consider:
 
 - missing/null readings;
 - genuine zero readings;
@@ -39,9 +39,33 @@ For historical energy changes, tests should explicitly consider:
 - spring DST (46 PT30M intervals);
 - autumn DST (50 PT30M intervals);
 - query end-boundary buckets;
+- PT30M cost being usage-only;
+- P1D cost containing standing charge;
+- completed-day residual `P1D - PT30M`;
+- P1D not yet available (`daily_pending`);
+- negative/contradictory residuals returning `unknown` rather than a negative charge;
+- effective-dated tariff ordering;
 - 429/5xx responses;
 - transient connection drops;
 - interruption during background backfill.
+
+## Cost-component statistics
+
+Historical cost-component tests verify that:
+
+- usage cost and standing charge are imported as separate GBP statistics;
+- the daily `state` is the amount for that component on that UK-local day;
+- the `sum` is cumulative for Recorder compatibility;
+- DST-local midnights are converted to the correct UTC statistics timestamp;
+- an unknown standing-charge split does not invent a historical value.
+
+These statistics are designed for Home Assistant's native Statistics Graph card with `chart_type: bar-stack` and one `state` series per component.
+
+## Tariff ledger
+
+`tariff-list` is treated as an effective-dated ledger. Tests cover stable ordering by `effectiveDate` / `from` and ensure tariff records remain separate from API-derived billing costs.
+
+The raw tariff values are not used to recalculate historical cost in tests. The cost resource remains authoritative.
 
 ## Real-data oracle
 
@@ -73,9 +97,13 @@ The live contract verifies:
 3. PT30M readings resolve the real first available interval near that locator;
 4. `last-time` has not regressed behind the known export;
 5. selected known historic days retain the exact expected PT30M timestamp geometry;
-6. both UK DST transition days retain the correct geometry: 46 spring intervals and 50 autumn intervals.
+6. both UK DST transition days retain the correct geometry: 46 spring intervals and 50 autumn intervals;
+7. a known completed cost day exposes PT30M cost and a larger P1D cost, proving a positive standing-charge residual;
+8. `tariff-list` returns effective-dated tariff history for the known electricity cost resource.
 
-The **current PT30M readings endpoint is authoritative for consumption values**. Exact old CSV totals or value hashes do not fail a release if the current API has revised them. The live contract is deliberately strict about boundaries, interval presence/order and DST geometry instead.
+The **current PT30M readings endpoint is authoritative for consumption values**. Exact old CSV totals or value hashes do not fail a release if the current API has revised them. The live contract is deliberately strict about boundaries, interval presence/order, DST geometry and aggregation semantics instead.
+
+The **current Glow cost endpoint is authoritative for billing values**. Tests use tariff history to explain tariff changes, not to overwrite or reconstruct the API's historical bill.
 
 The earliest exported day is also not treated as immutable because live testing demonstrated that very old Glowmarkt rows can disappear while the `first-time` metadata remains unchanged.
 
@@ -86,6 +114,7 @@ Live tests may report bounded diagnostics such as:
 - test-case date;
 - interval count;
 - missing/extra timestamps;
+- whether the P1D/PT30M relationship is valid;
 - pass/fail state.
 
 They must not print:
@@ -95,7 +124,8 @@ They must not print:
 - resource IDs where avoidable;
 - addresses/site names;
 - full raw readings;
-- full household consumption exports.
+- tariff values;
+- full household consumption or cost exports.
 
 ## When to run the live contract
 
@@ -105,6 +135,9 @@ Run it manually when a change affects:
 - resource discovery;
 - readings query parameters;
 - first/last history discovery;
+- cost aggregation periods;
+- standing-charge reconciliation;
+- tariff-list retrieval;
 - retry/backoff transport;
 - DST/day-boundary handling;
 - historical backfill/import semantics.

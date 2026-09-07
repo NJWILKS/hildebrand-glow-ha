@@ -29,6 +29,7 @@ from .const import (
     HISTORY_START_DELAY_SECONDS,
     MIN_POLL_INTERVAL,
 )
+from .costing import CostBreakdown, get_latest_cost_breakdown
 from .identity import sensor_unique_id, site_identity
 
 _LOGGER = logging.getLogger(__name__)
@@ -40,6 +41,16 @@ API_COST_CLASSIFIERS = (
     CLASSIFIER_ELECTRICITY_COST,
     CLASSIFIER_GAS_COST,
 )
+COMMODITY_CLASSIFIERS = {
+    "electricity": (
+        CLASSIFIER_ELECTRICITY_CONSUMPTION,
+        CLASSIFIER_ELECTRICITY_COST,
+    ),
+    "gas": (
+        CLASSIFIER_GAS_CONSUMPTION,
+        CLASSIFIER_GAS_COST,
+    ),
+}
 CUMULATIVE_STORAGE_VERSION = 1
 
 
@@ -77,6 +88,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._site_id = site_identity(virtual_entity_id, entry_id)
         self._resources: dict[str, dict[str, Any]] = {}
         self._last_readings: dict[str, DailyReading] = {}
+        self._cost_breakdowns: dict[str, CostBreakdown] = {}
         self._last_cost_refresh_at: datetime | None = None
         self._store = Store(
             hass,
@@ -313,6 +325,136 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             >= timedelta(minutes=self._cost_interval_minutes)
         )
 
+    async def _refresh_cost_breakdowns(self, now: datetime) -> None:
+        refreshed_any = False
+        for commodity, (_, cost_classifier) in COMMODITY_CLASSIFIERS.items():
+            resource_id = self._resource_id_for(cost_classifier)
+            if resource_id is None:
+                continue
+            try:
+                breakdown = await get_latest_cost_breakdown(
+                    self.api_client,
+                    resource_id,
+                    now_uk=now.astimezone(UK_TZ),
+                )
+            except GlowmarktApiError as err:
+                _LOGGER.warning(
+                    "Glowmarkt API-cost refresh failed for %s; preserving last value: %s",
+                    commodity,
+                    err,
+                )
+                continue
+            if breakdown is None:
+                continue
+
+            self._cost_breakdowns[commodity] = breakdown
+            self._last_readings[cost_classifier] = DailyReading(
+                day=breakdown.day,
+                value=breakdown.total_pence,
+                intervals=[],
+            )
+            refreshed_any = True
+
+        if refreshed_any:
+            self._last_cost_refresh_at = now
+
+    def _configured_daily_cost(self, commodity: str, consumption: float) -> float:
+        return round(
+            consumption * self.tariff_config.get(f"{commodity}_rate", 0)
+            + self.tariff_config.get(f"{commodity}_standing_charge", 0),
+            2,
+        )
+
+    def _compose_costs(
+        self,
+        values: dict[str, float | None],
+    ) -> tuple[dict[str, float | None], dict[str, dict[str, Any]]]:
+        costs: dict[str, float | None] = {}
+        diagnostics: dict[str, dict[str, Any]] = {}
+        standing_values: list[float] = []
+        standing_unknown = False
+
+        for commodity, (consumption_classifier, cost_classifier) in (
+            COMMODITY_CLASSIFIERS.items()
+        ):
+            has_commodity = (
+                consumption_classifier in self._resources
+                or cost_classifier in self._resources
+            )
+            if not has_commodity:
+                continue
+
+            breakdown = self._cost_breakdowns.get(commodity)
+            consumption = values.get(consumption_classifier)
+            if breakdown is not None:
+                costs[commodity] = round(breakdown.total_pence / 100.0, 2)
+                standing = breakdown.standing_charge_pence
+                costs[f"{commodity}_standing_charge"] = (
+                    round(standing / 100.0, 2) if standing is not None else None
+                )
+                if standing is None:
+                    standing_unknown = True
+                else:
+                    standing_values.append(standing / 100.0)
+                diagnostics[commodity] = {
+                    "source": "glow_api",
+                    "api_day": breakdown.day,
+                    "complete_day": breakdown.complete_day,
+                    "usage_cost_gbp": (
+                        round(breakdown.usage_pence / 100.0, 2)
+                        if breakdown.usage_pence is not None
+                        else None
+                    ),
+                    "standing_charge_status": breakdown.standing_charge_status,
+                }
+                continue
+
+            if consumption is not None:
+                configured_standing = self.tariff_config.get(
+                    f"{commodity}_standing_charge",
+                    0,
+                )
+                costs[commodity] = self._configured_daily_cost(
+                    commodity,
+                    consumption,
+                )
+                costs[f"{commodity}_standing_charge"] = round(
+                    configured_standing,
+                    2,
+                )
+                standing_values.append(float(configured_standing))
+                diagnostics[commodity] = {
+                    "source": "configured_fallback",
+                    "api_day": None,
+                    "complete_day": True,
+                    "usage_cost_gbp": None,
+                    "standing_charge_status": "configured_fallback",
+                }
+            else:
+                costs[commodity] = None
+                costs[f"{commodity}_standing_charge"] = None
+                standing_unknown = True
+                diagnostics[commodity] = {
+                    "source": "unavailable",
+                    "api_day": None,
+                    "complete_day": None,
+                    "usage_cost_gbp": None,
+                    "standing_charge_status": "unknown",
+                }
+
+        available_totals = [
+            float(costs[commodity])
+            for commodity in COMMODITY_CLASSIFIERS
+            if costs.get(commodity) is not None
+        ]
+        costs["total"] = round(sum(available_totals), 2) if available_totals else None
+        costs["standing_charges_total"] = (
+            None
+            if standing_unknown
+            else round(sum(standing_values), 2)
+        )
+        return costs, diagnostics
+
     async def _async_update_data(self) -> dict[str, Any]:
         try:
             if not self._resources:
@@ -329,20 +471,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             now = datetime.now(timezone.utc)
             if self._cost_refresh_due(now):
-                try:
-                    cost_readings = await self.api_client.get_readings(
-                        set(API_COST_CLASSIFIERS)
-                    )
-                except GlowmarktApiError as err:
-                    _LOGGER.warning(
-                        "Glowmarkt API-cost refresh failed; preserving last values: %s",
-                        err,
-                    )
-                else:
-                    for classifier, reading in cost_readings.items():
-                        if reading is not None:
-                            self._last_readings[classifier] = reading
-                    self._last_cost_refresh_at = now
+                await self._refresh_cost_breakdowns(now)
 
             merged = {
                 classifier: self._last_readings.get(classifier)
@@ -362,39 +491,14 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     else None
                 )
 
+            costs, cost_diagnostics = self._compose_costs(values)
             data: dict[str, Any] = {
                 "readings": values,
                 "cumulative_readings": cumulative_readings,
                 "resources": self._resources,
-                "costs": {},
+                "costs": costs,
+                "cost_diagnostics": cost_diagnostics,
             }
-
-            electricity = values.get(CLASSIFIER_ELECTRICITY_CONSUMPTION)
-            if electricity is not None:
-                data["costs"]["electricity"] = round(
-                    electricity * self.tariff_config.get("electricity_rate", 0)
-                    + self.tariff_config.get("electricity_standing_charge", 0),
-                    2,
-                )
-
-            gas = values.get(CLASSIFIER_GAS_CONSUMPTION)
-            if gas is not None:
-                data["costs"]["gas"] = round(
-                    gas * self.tariff_config.get("gas_rate", 0)
-                    + self.tariff_config.get("gas_standing_charge", 0),
-                    2,
-                )
-
-            data["costs"]["total"] = round(
-                data["costs"].get("electricity", 0)
-                + data["costs"].get("gas", 0),
-                2,
-            )
-            data["costs"]["standing_charges_total"] = round(
-                self.tariff_config.get("electricity_standing_charge", 0)
-                + self.tariff_config.get("gas_standing_charge", 0),
-                2,
-            )
 
             self.start_history_backfill()
             return data
@@ -439,3 +543,4 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def clear_daily_cache(self) -> None:
         self._last_readings.clear()
+        self._cost_breakdowns.clear()
