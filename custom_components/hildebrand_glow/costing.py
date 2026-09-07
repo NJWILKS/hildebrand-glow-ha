@@ -210,22 +210,30 @@ async def get_cost_history(
     resource_id: str,
     *,
     now_uk: datetime | None = None,
+    start_uk: datetime | None = None,
 ) -> list[CostBreakdown]:
-    """Fetch all complete historical usage and standing-charge components.
+    """Fetch complete historical usage and standing-charge components.
 
     PT30M cost data supplies the usage-only shape. P1D supplies the authoritative
     completed-day total. Their residual is the observed standing charge for that
-    day. The current UK-local day is deliberately excluded.
+    day. The current UK-local day is deliberately excluded. ``start_uk`` allows
+    callers to incrementally extend previously imported history without rescanning
+    the whole account.
     """
     if now_uk is None:
         now_uk = datetime.now(UK_TZ)
     else:
         now_uk = now_uk.astimezone(UK_TZ)
 
-    first = await api_client.get_first_available_reading_time(resource_id)
-    if first is None:
-        return []
-    start_uk = first.astimezone(UK_TZ).replace(
+    if start_uk is None:
+        first = await api_client.get_first_available_reading_time(resource_id)
+        if first is None:
+            return []
+        start_uk = first.astimezone(UK_TZ)
+    else:
+        start_uk = start_uk.astimezone(UK_TZ)
+
+    start_uk = start_uk.replace(
         hour=0,
         minute=0,
         second=0,

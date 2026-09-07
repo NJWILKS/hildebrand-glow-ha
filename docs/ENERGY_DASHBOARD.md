@@ -1,25 +1,30 @@
 # Home Assistant Energy dashboard
 
-The Hildebrand Glow integration supplies two different historical views of electricity cost because Home Assistant uses them for different purposes.
+The Hildebrand Glow integration supplies two related historical cost views because Home Assistant uses them for different purposes.
 
 ## Built-in Energy dashboard
 
 Configure **Settings → Dashboards → Energy → Electricity grid** with:
 
 - **Energy imported from grid:** `Smart Meter Electricity Consumption`
-- **Cost tracking:** **Use an entity tracking the total costs**
-- **Total-cost entity:** `Smart Meter Electricity Daily Cost`
+- **Cost tracking:** select the dedicated Hildebrand Glow electricity cost statistic created by the integration. In Home Assistant it is named **Hildebrand Glow Electricity Energy Cost**.
 
 Do not use `Total Daily Energy Cost` for the electricity grid. That entity combines electricity and gas when both commodities are available and would therefore attribute gas cost to electricity.
 
-`Electricity Daily Cost` is a monetary `TOTAL` sensor with a UK-local daily reset. Version 2.1.1 and later backfill its Recorder statistics with:
+Do not rely on `Electricity Daily Cost` as the Energy dashboard's historical cost source. It remains a useful human-facing sensor for the latest/current billing day, but version 2.1.2 and later publish a dedicated cumulative external statistic for Energy-dashboard billing history. This matches Home Assistant's own delayed-billing integrations such as Opower.
+
+The dedicated statistic is backfilled with:
 
 - the authoritative completed P1D Glow cost for each UK-local day;
 - the original PT30M usage-cost shape where available;
 - the P1D-minus-PT30M residual folded into the first hour so the complete day's statistic still equals the Glow P1D bill;
 - a cumulative `sum` column, which is the value Home Assistant's Energy dashboard uses for historical cost.
 
-On upgrade from 2.1.0, the cost-history backfill schema is advanced automatically so existing installations receive the missing Energy-dashboard cost statistics without deleting entities or Recorder history.
+Recorder keeps sub-penny precision for imported cost data. The UI may still display normal currency rounding, but that display formatting no longer changes the accumulated billing statistic.
+
+On upgrade from 2.1.1, the cost-history schema advances automatically so existing installations receive the dedicated Energy-dashboard cost statistic without deleting entities or Recorder history.
+
+Cost history is then extended incrementally every six hours. A trailing completed day is not finalised until Glow has published its P1D bucket, so the integration does not accidentally treat a usage-only PT30M total as the final bill.
 
 For the current partial day, Glow PT30M cost is usage-only. The standing charge appears only after Glow publishes the completed P1D bucket.
 
@@ -50,4 +55,4 @@ Home Assistant may choose different entity IDs if the names already existed; use
 
 ## Gas
 
-When usable gas data is available, configure the Energy dashboard gas source with `Smart Meter Gas Consumption` and `Smart Meter Gas Daily Cost` using the same pattern. If the DCC/Glow gas resource exists but currently has no readings, the gas entities remain `Unknown` rather than being treated as zero.
+When usable gas data is available, configure the Energy dashboard gas source with `Smart Meter Gas Consumption` and the dedicated **Hildebrand Glow Gas Energy Cost** statistic using the same pattern. If the DCC/Glow gas resource exists but currently has no readings, the gas entities remain `Unknown` rather than being treated as zero.

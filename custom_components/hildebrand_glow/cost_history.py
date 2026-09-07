@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.components.recorder.models import (
@@ -11,7 +12,10 @@ from homeassistant.components.recorder.models import (
     StatisticMeanType,
     StatisticMetaData,
 )
-from homeassistant.components.recorder.statistics import async_import_statistics
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    async_import_statistics,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
@@ -29,12 +33,14 @@ from .identity import sensor_unique_id
 
 _LOGGER = logging.getLogger(__name__)
 COST_HISTORY_STORAGE_VERSION = 1
-COST_BACKFILL_SCHEMA_VERSION = 2
+COST_BACKFILL_SCHEMA_VERSION = 3
 TARIFF_HISTORY_STORAGE_VERSION = 1
 INITIAL_DELAY_SECONDS = 30
 ENTITY_WAIT_RETRIES = 6
 ENTITY_WAIT_SECONDS = 5
+COST_HISTORY_REFRESH_SECONDS = 6 * 60 * 60
 TARIFF_REFRESH_SECONDS = 24 * 60 * 60
+STAT_PRECISION = 6
 
 COMPONENT_KEYS = {
     "electricity": (
@@ -52,6 +58,15 @@ COMPONENT_KEYS = {
 }
 
 
+def _round_stat(value: float) -> float:
+    """Keep billing precision in Recorder while avoiding float noise."""
+    return round(float(value), STAT_PRECISION)
+
+
+def _gbp_from_pence(value: float) -> float:
+    return _round_stat(float(value) / 100.0)
+
+
 def _metadata(entity_id: str) -> StatisticMetaData:
     return StatisticMetaData(
         has_sum=True,
@@ -59,6 +74,25 @@ def _metadata(entity_id: str) -> StatisticMetaData:
         name=None,
         source="recorder",
         statistic_id=entity_id,
+        unit_class=None,
+        unit_of_measurement="GBP",
+    )
+
+
+def energy_cost_statistic_id(site_id: str, commodity: str) -> str:
+    """Return a stable Home Assistant external statistic ID for Energy cost."""
+    safe_site = re.sub(r"[^a-z0-9_]+", "_", site_id.lower()).strip("_")
+    safe_commodity = re.sub(r"[^a-z0-9_]+", "_", commodity.lower()).strip("_")
+    return f"{DOMAIN}:{safe_site}_{safe_commodity}_energy_cost"
+
+
+def _external_cost_metadata(site_id: str, commodity: str) -> StatisticMetaData:
+    return StatisticMetaData(
+        has_sum=True,
+        mean_type=StatisticMeanType.NONE,
+        name=f"Hildebrand Glow {commodity.title()} Energy Cost",
+        source=DOMAIN,
+        statistic_id=energy_cost_statistic_id(site_id, commodity),
         unit_class=None,
         unit_of_measurement="GBP",
     )
@@ -72,27 +106,36 @@ def _day_start_utc(day: str) -> datetime:
     )
 
 
-def build_total_cost_statistics(history: list[CostBreakdown]) -> list[StatisticData]:
-    """Build authoritative total-cost statistics for the Energy dashboard.
+def _next_day_start_uk(day: str) -> datetime:
+    return datetime.fromisoformat(day).replace(tzinfo=UK_TZ) + timedelta(days=1)
+
+
+def build_total_cost_statistics(
+    history: list[CostBreakdown],
+    *,
+    baseline: float = 0.0,
+) -> list[StatisticData]:
+    """Build authoritative cumulative cost statistics for the Energy dashboard.
 
     Historical PT30M cost preserves the usage-cost shape. Any difference between
     those intervals and the authoritative completed P1D total is applied to the
-    first hour of that UK-local day. For normal Bright data that residual is the
-    standing charge. If detailed intervals are unavailable, the complete daily
-    total is imported at the UK-local day boundary instead.
+    first hour of that UK-local day. Values retain sub-penny precision in Recorder;
+    the UI is free to display them rounded to normal currency precision.
     """
-    running = 0.0
+    running = _round_stat(baseline)
     stats: list[StatisticData] = []
 
     for breakdown in history:
-        total_gbp = round(breakdown.total_pence / 100.0, 2)
-        hourly: dict[datetime, float] = {}
+        total_gbp = _gbp_from_pence(breakdown.total_pence)
+        hourly_pence: dict[datetime, float] = {}
         for timestamp, value_pence in breakdown.usage_intervals:
             hour_start = timestamp.replace(minute=0, second=0, microsecond=0)
-            hourly[hour_start] = hourly.get(hour_start, 0.0) + value_pence / 100.0
+            hourly_pence[hour_start] = (
+                hourly_pence.get(hour_start, 0.0) + float(value_pence)
+            )
 
-        if not hourly:
-            running = round(running + total_gbp, 2)
+        if not hourly_pence:
+            running = _round_stat(running + total_gbp)
             stats.append(
                 StatisticData(
                     start=_day_start_utc(breakdown.day),
@@ -102,18 +145,20 @@ def build_total_cost_statistics(history: list[CostBreakdown]) -> list[StatisticD
             )
             continue
 
-        ordered_hours = sorted(hourly)
-        usage_gbp = round(sum(hourly.values()), 2)
-        residual_gbp = round(total_gbp - usage_gbp, 2)
-        if residual_gbp:
-            hourly[ordered_hours[0]] = round(
-                hourly[ordered_hours[0]] + residual_gbp,
-                2,
-            )
+        ordered_hours = sorted(hourly_pence)
+        residual_pence = float(breakdown.total_pence) - sum(hourly_pence.values())
+        if residual_pence:
+            hourly_pence[ordered_hours[0]] += residual_pence
 
-        for hour_start in ordered_hours:
-            state = round(hourly[hour_start], 2)
-            running = round(running + state, 2)
+        day_states = [_gbp_from_pence(hourly_pence[hour]) for hour in ordered_hours]
+        # Make the daily states reconcile exactly to the authoritative P1D total
+        # even if binary floating-point conversion introduced a tiny remainder.
+        correction = _round_stat(total_gbp - sum(day_states))
+        if correction:
+            day_states[-1] = _round_stat(day_states[-1] + correction)
+
+        for hour_start, state in zip(ordered_hours, day_states, strict=True):
+            running = _round_stat(running + state)
             stats.append(
                 StatisticData(
                     start=hour_start,
@@ -127,10 +172,13 @@ def build_total_cost_statistics(history: list[CostBreakdown]) -> list[StatisticD
 
 def build_component_statistics(
     history: list[CostBreakdown],
+    *,
+    usage_baseline: float = 0.0,
+    standing_baseline: float = 0.0,
 ) -> tuple[list[StatisticData], list[StatisticData]]:
-    """Build daily usage/standing states with cumulative sums for Recorder."""
-    usage_running = 0.0
-    standing_running = 0.0
+    """Build daily usage/standing states with precise cumulative sums."""
+    usage_running = _round_stat(usage_baseline)
+    standing_running = _round_stat(standing_baseline)
     usage_stats: list[StatisticData] = []
     standing_stats: list[StatisticData] = []
 
@@ -138,8 +186,8 @@ def build_component_statistics(
         start = _day_start_utc(breakdown.day)
 
         if breakdown.usage_pence is not None:
-            usage_gbp = round(breakdown.usage_pence / 100.0, 2)
-            usage_running = round(usage_running + usage_gbp, 2)
+            usage_gbp = _gbp_from_pence(breakdown.usage_pence)
+            usage_running = _round_stat(usage_running + usage_gbp)
             usage_stats.append(
                 StatisticData(
                     start=start,
@@ -149,8 +197,8 @@ def build_component_statistics(
             )
 
         if breakdown.standing_charge_pence is not None:
-            standing_gbp = round(breakdown.standing_charge_pence / 100.0, 2)
-            standing_running = round(standing_running + standing_gbp, 2)
+            standing_gbp = _gbp_from_pence(breakdown.standing_charge_pence)
+            standing_running = _round_stat(standing_running + standing_gbp)
             standing_stats.append(
                 StatisticData(
                     start=start,
@@ -177,21 +225,37 @@ async def _entity_id(
     return None
 
 
-async def _backfill_cost_statistics(
+def _last_sum(stats: list[StatisticData], fallback: float) -> float:
+    if not stats:
+        return _round_stat(fallback)
+    value = stats[-1].get("sum")
+    return _round_stat(float(value)) if value is not None else _round_stat(fallback)
+
+
+def _trim_trailing_pending(history: list[CostBreakdown]) -> list[CostBreakdown]:
+    """Do not finalise recent days until Glow has published the P1D bucket."""
+    settled = list(history)
+    while settled and settled[-1].standing_charge_status == "daily_pending":
+        settled.pop()
+    return settled
+
+
+async def _sync_cost_statistics(
     hass: HomeAssistant,
     coordinator: GlowmarktDataUpdateCoordinator,
     site_id: str,
 ) -> None:
+    """Initial-backfill and then incrementally extend cost statistics."""
     store = Store(
         hass,
         COST_HISTORY_STORAGE_VERSION,
         f"{DOMAIN}_{site_id}_cost_history",
     )
     state = await store.async_load() or {}
-    if state.get("_backfilled_version") == COST_BACKFILL_SCHEMA_VERSION:
-        return
-
+    full_backfill = state.get("_backfilled_version") != COST_BACKFILL_SCHEMA_VERSION
+    commodity_state = state.setdefault("commodities", {})
     imported: dict[str, int] = {}
+
     for commodity, (
         cost_classifier,
         daily_key,
@@ -212,27 +276,65 @@ async def _backfill_cost_statistics(
             )
             return
 
+        previous = commodity_state.get(commodity, {}) if not full_backfill else {}
+        last_day = previous.get("last_day")
+        start_uk = (
+            _next_day_start_uk(str(last_day))
+            if last_day and not full_backfill
+            else None
+        )
         history = await get_cost_history(
             coordinator.api_client,
             resource["resource_id"],
+            start_uk=start_uk,
         )
-        total_stats = build_total_cost_statistics(history)
-        usage_stats, standing_stats = build_component_statistics(history)
+        history = _trim_trailing_pending(history)
+        if not history:
+            continue
+
+        total_baseline = float(previous.get("total_sum_gbp", 0.0))
+        usage_baseline = float(previous.get("usage_sum_gbp", 0.0))
+        standing_baseline = float(previous.get("standing_sum_gbp", 0.0))
+
+        total_stats = build_total_cost_statistics(
+            history,
+            baseline=total_baseline,
+        )
+        usage_stats, standing_stats = build_component_statistics(
+            history,
+            usage_baseline=usage_baseline,
+            standing_baseline=standing_baseline,
+        )
+
+        # Keep the human-facing daily entity history for normal HA history cards.
         if total_stats:
             async_import_statistics(hass, _metadata(daily_entity), total_stats)
+            # The Energy dashboard gets a dedicated cumulative statistic, matching
+            # Home Assistant's own delayed-billing integrations such as Opower.
+            async_add_external_statistics(
+                hass,
+                _external_cost_metadata(site_id, commodity),
+                total_stats,
+            )
         if usage_stats:
             async_import_statistics(hass, _metadata(usage_entity), usage_stats)
         if standing_stats:
             async_import_statistics(hass, _metadata(standing_entity), standing_stats)
+
+        commodity_state[commodity] = {
+            "last_day": history[-1].day,
+            "total_sum_gbp": _last_sum(total_stats, total_baseline),
+            "usage_sum_gbp": _last_sum(usage_stats, usage_baseline),
+            "standing_sum_gbp": _last_sum(standing_stats, standing_baseline),
+        }
         imported[commodity] = len(history)
 
     state["_backfilled"] = True
     state["_backfilled_version"] = COST_BACKFILL_SCHEMA_VERSION
-    state["days"] = imported
     await store.async_save(state)
     if imported:
         _LOGGER.info(
-            "Backfilled Glowmarkt Energy cost totals/components: %s",
+            "Synced Glowmarkt Energy cost totals/components: %s",
             ", ".join(f"{commodity}={days} day(s)" for commodity, days in imported.items()),
         )
 
@@ -287,21 +389,40 @@ async def async_cost_history_worker(
     coordinator: GlowmarktDataUpdateCoordinator,
     site_id: str,
 ) -> None:
-    """Backfill Energy/dashboard cost history, then keep tariff history current."""
+    """Maintain Energy cost statistics and the effective-dated tariff ledger."""
     await asyncio.sleep(INITIAL_DELAY_SECONDS)
 
     try:
-        await _backfill_cost_statistics(hass, coordinator, site_id)
+        await _sync_cost_statistics(hass, coordinator, site_id)
     except asyncio.CancelledError:
         raise
     except Exception:
-        _LOGGER.exception("Glowmarkt cost-history backfill failed")
+        _LOGGER.exception("Glowmarkt cost-history sync failed")
 
+    try:
+        await _refresh_tariff_ledger(hass, coordinator, site_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOGGER.exception("Glowmarkt tariff-history refresh failed")
+
+    cost_refreshes = 0
     while True:
+        await asyncio.sleep(COST_HISTORY_REFRESH_SECONDS)
+        try:
+            await _sync_cost_statistics(hass, coordinator, site_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Glowmarkt cost-history sync failed")
+
+        cost_refreshes += 1
+        if cost_refreshes * COST_HISTORY_REFRESH_SECONDS < TARIFF_REFRESH_SECONDS:
+            continue
+        cost_refreshes = 0
         try:
             await _refresh_tariff_ledger(hass, coordinator, site_id)
         except asyncio.CancelledError:
             raise
         except Exception:
             _LOGGER.exception("Glowmarkt tariff-history refresh failed")
-        await asyncio.sleep(TARIFF_REFRESH_SECONDS)
