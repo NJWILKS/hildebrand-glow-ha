@@ -31,11 +31,18 @@ def test_cost_component_statistics_are_daily_stackable_states() -> None:
 
     usage, standing = build_component_statistics(history)
 
-    assert [item.state for item in usage] == [3.0, 2.5]
-    assert [item.sum for item in usage] == [3.0, 5.5]
-    assert [item.state for item in standing] == [0.47, 0.0]
-    assert [item.sum for item in standing] == [0.47, 0.47]
-    assert usage[0].start == datetime(2025, 10, 25, 23, 0, tzinfo=timezone.utc)
+    assert [item["state"] for item in usage] == [3.0, 2.5]
+    assert [item["sum"] for item in usage] == [3.0, 5.5]
+    assert [item["state"] for item in standing] == [0.47, 0.0]
+    assert [item["sum"] for item in standing] == [0.47, 0.47]
+    assert usage[0]["start"] == datetime(
+        2025,
+        10,
+        25,
+        23,
+        0,
+        tzinfo=timezone.utc,
+    )
 
 
 def test_unknown_standing_charge_does_not_invent_historical_value() -> None:
@@ -53,7 +60,14 @@ def test_unknown_standing_charge_does_not_invent_historical_value() -> None:
     usage, standing = build_component_statistics(history)
 
     assert len(usage) == 1
-    assert usage[0].start == datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)
+    assert usage[0]["start"] == datetime(
+        2026,
+        3,
+        29,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
     assert standing == []
 
 
