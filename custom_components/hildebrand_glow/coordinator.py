@@ -52,6 +52,7 @@ COMMODITY_CLASSIFIERS = {
     ),
 }
 CUMULATIVE_STORAGE_VERSION = 1
+CUMULATIVE_BACKFILL_SCHEMA_VERSION = 2
 
 
 class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -133,7 +134,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         reading: DailyReading,
         baseline: float,
     ) -> float:
-        """Import a day's true hourly shape and return its ending cumulative sum."""
+        """Import a day's shape while preserving TOTAL_INCREASING state semantics."""
         hourly: dict[datetime, float] = {}
         for timestamp, value in reading.intervals:
             hour_start = timestamp.replace(minute=0, second=0, microsecond=0)
@@ -143,11 +144,12 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         stats: list[StatisticData] = []
         for hour_start in sorted(hourly):
             running += hourly[hour_start]
+            cumulative = round(running, 3)
             stats.append(
                 StatisticData(
                     start=hour_start,
-                    state=round(hourly[hour_start], 3),
-                    sum=round(running, 3),
+                    state=cumulative,
+                    sum=cumulative,
                 )
             )
         if stats:
@@ -227,12 +229,18 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_backfill_history(self) -> None:
         """Import all real hourly consumption history without blocking startup."""
         completed = False
+        repair_legacy_current_day = False
         try:
             async with self._cumulative_lock:
                 cumulative = await self._load_cumulative()
-                if cumulative.get("_backfilled"):
+                previous_version = int(cumulative.get("_backfilled_version", 0) or 0)
+                if (
+                    cumulative.get("_backfilled")
+                    and previous_version >= CUMULATIVE_BACKFILL_SCHEMA_VERSION
+                ):
                     completed = True
                     return
+                repair_legacy_current_day = bool(cumulative.get("_backfilled"))
 
             history = await self.api_client.get_available_readings(
                 set(CUMULATIVE_CLASSIFIERS)
@@ -266,42 +274,49 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         }
                     cumulative[classifier] = entry
 
-                    today_start_uk = datetime.now(UK_TZ).replace(
-                        hour=0,
-                        minute=0,
-                        second=0,
-                        microsecond=0,
-                    )
-                    today_start_utc = today_start_uk.astimezone(timezone.utc)
-                    current_hour_utc = datetime.now(timezone.utc).replace(
-                        minute=0,
-                        second=0,
-                        microsecond=0,
-                    )
-                    hours_elapsed = max(
-                        0,
-                        int(
-                            (current_hour_utc - today_start_utc).total_seconds()
-                            // 3600
+                    # v2.1.x wrote state=0 with the lifetime sum into today's hours.
+                    # On upgrade, overwrite those poisoned rows once with a state that
+                    # matches the live TOTAL_INCREASING entity. Fresh installs do not
+                    # write synthetic current-day statistics at all.
+                    if repair_legacy_current_day and entry.get("day") is not None:
+                        today_start_uk = datetime.now(UK_TZ).replace(
+                            hour=0,
+                            minute=0,
+                            second=0,
+                            microsecond=0,
                         )
-                        + 1,
-                    )
-                    if hours_elapsed:
-                        gap_stats = [
+                        today_start_utc = today_start_uk.astimezone(timezone.utc)
+                        current_hour_utc = datetime.now(timezone.utc).replace(
+                            minute=0,
+                            second=0,
+                            microsecond=0,
+                        )
+                        hours_elapsed = max(
+                            0,
+                            int(
+                                (current_hour_utc - today_start_utc).total_seconds()
+                                // 3600
+                            )
+                            + 1,
+                        )
+                        carry_forward = float(entry["cumulative"])
+                        repair_stats = [
                             StatisticData(
                                 start=today_start_utc + timedelta(hours=hour),
-                                state=0.0,
-                                sum=float(entry["cumulative"]),
+                                state=carry_forward,
+                                sum=carry_forward,
                             )
                             for hour in range(hours_elapsed)
                         ]
-                        async_import_statistics(
-                            self.hass,
-                            self._metadata_for(entity_id),
-                            gap_stats,
-                        )
+                        if repair_stats:
+                            async_import_statistics(
+                                self.hass,
+                                self._metadata_for(entity_id),
+                                repair_stats,
+                            )
 
                 cumulative["_backfilled"] = True
+                cumulative["_backfilled_version"] = CUMULATIVE_BACKFILL_SCHEMA_VERSION
                 await self._store.async_save(cumulative)
                 completed = True
                 _LOGGER.info(
