@@ -1,6 +1,7 @@
 """Sensor platform for Hildebrand Glow integration."""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -15,6 +16,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .api import UK_TZ
 from .const import (
     ATTRIBUTION,
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
@@ -78,6 +80,7 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "costs",
         "reading_key": "electricity",
         "diagnostic_commodity": "electricity",
+        "daily_reset": True,
     },
     "electricity_usage_cost": {
         "name": "Electricity Usage Cost",
@@ -88,6 +91,7 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "costs",
         "reading_key": "electricity_usage",
         "diagnostic_commodity": "electricity",
+        "daily_reset": True,
     },
     "electricity_standing_charge": {
         "name": "Electricity Standing Charge",
@@ -98,6 +102,7 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "costs",
         "reading_key": "electricity_standing_charge",
         "diagnostic_commodity": "electricity",
+        "daily_reset": True,
     },
     "gas_daily_cost": {
         "name": "Gas Daily Cost",
@@ -108,6 +113,7 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "costs",
         "reading_key": "gas",
         "diagnostic_commodity": "gas",
+        "daily_reset": True,
     },
     "gas_usage_cost": {
         "name": "Gas Usage Cost",
@@ -118,6 +124,7 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "costs",
         "reading_key": "gas_usage",
         "diagnostic_commodity": "gas",
+        "daily_reset": True,
     },
     "gas_standing_charge": {
         "name": "Gas Standing Charge",
@@ -128,6 +135,7 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "costs",
         "reading_key": "gas_standing_charge",
         "diagnostic_commodity": "gas",
+        "daily_reset": True,
     },
     "total_daily_cost": {
         "name": "Total Daily Energy Cost",
@@ -255,6 +263,22 @@ class GlowmarktSensor(
                 return round(value, 2)
             return round(value, 3)
         return value
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return the UK-local billing-day boundary for daily monetary sensors."""
+        if not self._description.get("daily_reset") or self.coordinator.data is None:
+            return None
+        commodity = self._description.get("diagnostic_commodity")
+        if not isinstance(commodity, str):
+            return None
+        diagnostics = self.coordinator.data.get("cost_diagnostics", {}).get(commodity)
+        if not diagnostics:
+            return None
+        api_day = diagnostics.get("api_day")
+        if not isinstance(api_day, str) or not api_day:
+            return None
+        return datetime.fromisoformat(api_day).replace(tzinfo=UK_TZ)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
