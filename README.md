@@ -8,7 +8,7 @@ A maintained rescue fork of the Home Assistant integration for UK SMETS2 smart m
 ## What this fork adds
 
 - **Full historical electricity and gas consumption import** into Home Assistant Recorder statistics using the original half-hour timestamps.
-- **Historical cost-component import**: Glow PT30M cost is treated as usage-only and completed P1D cost as usage plus standing charge, allowing the standing charge to be observed rather than guessed.
+- **Historical cost-component import**: Glow P1D remains the authoritative daily bill, while effective-dated tariff standing charges are used to split that bill into usage and standing-charge components without preserving noisy day-by-day aggregation residuals.
 - **Native Home Assistant stacked cost graphs** using separate Usage Cost and Standing Charge monetary sensors with backfilled Recorder statistics.
 - **Effective-dated tariff history** from Glow `tariff-list`, persisted locally and refreshed daily so rate/cap changes are not flattened into today's tariff.
 - **Full-history discovery without an arbitrary look-back limit**: Glowmarkt `first-time` is used as a cheap locator, then the PT30M readings endpoint determines the first actual billing interval.
@@ -42,7 +42,7 @@ The setup flow asks for:
 - electricity unit rate and standing charge
 - gas unit rate and standing charge
 
-The configured tariff values are **fallback values**. When Glow cost resources are available, the API-derived cost is authoritative and Glow's effective-dated `tariff-list` is stored separately as the historical tariff ledger.
+The configured tariff values are **current-tariff calibration and fallback values**. When Glow cost resources are available, Glow P1D cost is authoritative for the amount actually charged. The configured current values are compared with the latest effective tariff period and can supply an exact current value when Glow's historical plan detail is incomplete but the residual evidence agrees.
 
 After setup, **Configure** also exposes:
 
@@ -78,22 +78,31 @@ Bright/Glow cost resources have different aggregation semantics:
 - **PT30M and hourly cost** represent usage cost only; standing charge is not included.
 - **P1D, weekly and monthly cost** include standing charge.
 
-The integration therefore does not assume that a configured standing charge has already been applied. For a completed UK-local day it calculates:
+The important wrinkle is that `P1D - sum(PT30M)` is not perfectly stable from day to day. The separately aggregated values carry enough rounding/aggregation noise that treating each day's residual as a new standing charge produces an unrealistic saw-tooth graph.
 
-`observed standing charge = Glow P1D cost - sum(Glow PT30M cost)`
+The integration therefore uses a hierarchy of evidence:
 
-The Glow P1D total remains authoritative. The residual is used only to separate the bill into usage and standing-charge components.
+1. **Glow P1D cost is authoritative for the completed day's total bill.**
+2. **Glow `tariff-list` effective dates and plan details define the historical tariff periods.** When a period exposes `standing` directly, that value is used for every completed day in the period.
+3. **If a historical tariff period does not expose a standing charge**, the integration derives one stable value from the median of all positive `P1D - sum(PT30M)` residuals within that exact period.
+4. **The configured current standing charge and unit rate are calibration anchors** for the latest period. A configured current standing charge can replace an inferred noisy median only when the residual cluster agrees within a robust tolerance.
+5. **Daily usage cost is then `P1D total - resolved standing charge`**, so usage plus standing charge always reconciles to the authoritative Glow P1D bill.
+6. **PT30M cost is retained for intraday shape**, not as the source of truth for the daily standing-charge amount.
 
-For the current partial day, the integration uses PT30M cost only and reports a standing-charge component of **£0** until Glow publishes a completed P1D bucket. If one side of the reconciliation is missing or contradictory, the standing-charge split is reported as unavailable/unknown instead of being invented.
+This gives a piecewise-constant standing-charge history: the value remains stable throughout a tariff period and changes only at an effective tariff boundary. Flat unit rates are recorded where Glow exposes one; time-of-use and dynamic tariffs retain their tariff type instead of being flattened to a single rate.
 
-Historical cost backfill fetches PT30M cost in DST-safe bounded chunks and P1D cost in bounded daily chunks, joins them by UK-local date and imports separate historical states for:
+For the current partial day, the integration still uses PT30M cost only and reports a standing-charge component of **£0** until Glow publishes a completed P1D bucket. Trailing days remain pending rather than being finalised with guessed values.
+
+Historical cost backfill imports separate historical states for:
 
 - **Electricity Usage Cost**
 - **Electricity Standing Charge**
 - **Gas Usage Cost**
 - **Gas Standing Charge**
 
-These are monetary `TOTAL` sensors with long-term Recorder statistics.
+These are monetary `TOTAL` sensors with long-term Recorder statistics. The dedicated Energy-dashboard cumulative cost statistic remains based on the exact P1D total and is not altered by how the bill is split into components.
+
+Version **2.1.3** advances the cost-history schema, so upgrading an existing installation reruns the cost-component backfill and replaces previously imported noisy day-by-day standing-charge residuals with effective-dated tariff-period values.
 
 ### Native stacked cost graph
 
@@ -117,9 +126,11 @@ The same card can use `week`, `month` or `year` periods, and can be tied to an E
 
 ## Tariff history
 
-Glow's `tariff-list` is treated as an effective-dated ledger rather than a set of constants. The integration stores the returned tariff history per commodity and refreshes it daily. That preserves historical rate/standing-charge changes such as price-cap changes without recalculating old bills using today's tariff.
+Glow's `tariff-list` is treated as an effective-dated ledger rather than a set of constants. The integration stores the returned tariff history per commodity and refreshes it daily. It also stores the derived period analysis locally: resolved standing charge, flat unit rate where applicable, residual sample count/median/MAD and comparison with the configured current tariff.
 
-The **cost API remains authoritative for actual historical charges**. The tariff ledger explains which tariff was effective; it does not overwrite API-derived historical costs.
+That preserves historical standing-charge and unit-rate changes such as price-cap changes without recalculating old bills using today's tariff. Glow documents that DCC tariff history may be unavailable before the meter/account registration point; any leading period without tariff plan detail can only be inferred from the billing residual evidence available for that period.
+
+The **P1D cost API remains authoritative for actual historical charges**. Tariff data is used to split and explain that total, never to rewrite the bill itself.
 
 ## Sensors
 
@@ -138,7 +149,8 @@ The protected live test uses repository environment credentials and verifies:
 - `last-time` has not regressed behind the known export;
 - known completed days retain the exact expected half-hour timestamp geometry, including **50** intervals on the autumn DST day and **46** on the spring DST day;
 - a known completed electricity-cost day has a positive P1D-minus-PT30M standing-charge residual;
-- `tariff-list` returns effective-dated tariff history for the known electricity cost resource.
+- `tariff-list` returns effective-dated tariff history for the known electricity cost resource;
+- a recent real tariff period has enough completed-day evidence for its noisy residual cluster to centre plausibly on Glow's explicit standing charge, without printing the household tariff into Actions logs.
 
 The contributed CSV is a historical snapshot, not an immutable billing ledger. Live testing proved that Glowmarkt can revise or remove old consumption values while preserving the same timestamp geometry and `first-time` metadata. The **current PT30M readings API is therefore authoritative for consumption values**; old CSV totals and value fingerprints are useful evidence, but they are not release gates.
 
