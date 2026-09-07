@@ -42,13 +42,13 @@
       "init": {
         "title": "Hildebrand Glow",
         "menu_options": {
-          "settings": "Settings",
+          "settings": "Tariff and polling settings",
           "reset_history": "Reset imported history"
         }
       },
       "settings": {
-        "title": "Hildebrand Glow Settings",
-        "description": "Change tariff values and API polling intervals. Polling below 5 minutes is blocked to protect the Glowmarkt API.",
+        "title": "Tariff and polling settings",
+        "description": "Change fallback tariff values and API polling intervals. Polling below 5 minutes is blocked to protect the Glowmarkt API.",
         "data": {
           "electricity_rate": "Electricity Rate (£/kWh)",
           "electricity_standing_charge": "Electricity Standing Charge (£/day)",
@@ -59,16 +59,16 @@
         }
       },
       "reset_history": {
-        "title": "Reset imported Hildebrand history",
-        "description": "This removes only Hildebrand Glow statistics and the integration's local backfill/tariff cache for this meter site. Credentials, entity registry entries, dashboards and unrelated Home Assistant history are preserved. After confirmation the integration reloads and rebuilds its history from Glow."
+        "title": "Reset imported history",
+        "description": "Clear Hildebrand Glow's imported statistics and local backfill/tariff cache for this meter site, then rebuild them from Glow. Your credentials, entities, dashboards and unrelated Home Assistant history are not removed. Use this when imported history needs to be rebuilt or repaired."
       }
     },
     "error": {
-      "reset_failed": "The Hildebrand history reset failed. The existing configuration has been preserved.",
-      "reload_failed": "History was reset, but the integration could not be loaded again. Reload the integration from Settings after checking the logs."
+      "reset_failed": "The Hildebrand history reset failed. Your existing configuration has been preserved.",
+      "reload_failed": "History was reset, but the integration could not be loaded again. Check the logs and reload the integration from Settings."
     },
     "abort": {
-      "reset_complete": "Reset complete. {count} Hildebrand statistic IDs were cleared and the integration has been started again for a clean backfill."
+      "reset_complete": "Reset complete. {count} Hildebrand statistic IDs were cleared and the integration has restarted a clean backfill."
     }
   }
 }
