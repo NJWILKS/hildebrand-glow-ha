@@ -182,11 +182,11 @@ async def async_setup_entry(
         for sensor_key, description in SENSOR_DESCRIPTIONS.items()
     ]
     async_add_entities(entities)
-    cost_history_task = hass.async_create_task(
+    config_entry.async_create_background_task(
+        hass,
         async_cost_history_worker(hass, coordinator, site_id),
-        name=f"{DOMAIN} cost history worker",
+        f"{DOMAIN} cost history worker",
     )
-    config_entry.async_on_unload(cost_history_task.cancel)
 
 
 class GlowmarktSensor(

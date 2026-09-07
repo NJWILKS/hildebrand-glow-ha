@@ -40,6 +40,13 @@
   "options": {
     "step": {
       "init": {
+        "title": "Hildebrand Glow",
+        "menu_options": {
+          "settings": "Settings",
+          "reset_history": "Reset imported history"
+        }
+      },
+      "settings": {
         "title": "Hildebrand Glow Settings",
         "description": "Change tariff values and API polling intervals. Polling below 5 minutes is blocked to protect the Glowmarkt API.",
         "data": {
@@ -50,7 +57,18 @@
           "consumption_interval_minutes": "Consumption refresh interval (minutes)",
           "api_cost_interval_minutes": "API cost refresh interval (minutes)"
         }
+      },
+      "reset_history": {
+        "title": "Reset imported Hildebrand history",
+        "description": "This removes only Hildebrand Glow statistics and the integration's local backfill/tariff cache for this meter site. Credentials, entity registry entries, dashboards and unrelated Home Assistant history are preserved. After confirmation the integration reloads and rebuilds its history from Glow."
       }
+    },
+    "error": {
+      "reset_failed": "The Hildebrand history reset failed. The existing configuration has been preserved.",
+      "reload_failed": "History was reset, but the integration could not be loaded again. Reload the integration from Settings after checking the logs."
+    },
+    "abort": {
+      "reset_complete": "Reset complete. {count} Hildebrand statistic IDs were cleared and the integration has been started again for a clean backfill."
     }
   }
 }

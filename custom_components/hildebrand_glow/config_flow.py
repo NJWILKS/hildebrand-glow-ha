@@ -35,6 +35,7 @@ from .const import (
     MIN_POLL_INTERVAL,
 )
 from .identity import config_unique_id
+from .reset import async_reset_imported_history
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -194,6 +195,17 @@ class HildebrandGlowOptionsFlow(config_entries.OptionsFlow):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> FlowResult:
+        """Choose between normal settings and maintenance actions."""
+        return self.async_show_menu(
+            step_id="init",
+            menu_options=["settings", "reset_history"],
+        )
+
+    async def async_step_settings(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> FlowResult:
+        """Change tariff and polling settings."""
         if user_input is not None:
             new_data = {**self.config_entry.data, **user_input}
             self.hass.config_entries.async_update_entry(
@@ -208,7 +220,7 @@ class HildebrandGlowOptionsFlow(config_entries.OptionsFlow):
             vol.Range(min=MIN_POLL_INTERVAL, max=1440),
         )
         return self.async_show_form(
-            step_id="init",
+            step_id="settings",
             data_schema=vol.Schema(
                 {
                     vol.Required(
@@ -255,4 +267,52 @@ class HildebrandGlowOptionsFlow(config_entries.OptionsFlow):
                     ): interval_validator,
                 }
             ),
+        )
+
+    async def async_step_reset_history(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> FlowResult:
+        """Confirm and execute a Hildebrand-only history reset."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            was_loaded = self.config_entry.state is config_entries.ConfigEntryState.LOADED
+            unloaded = True
+            if was_loaded:
+                unloaded = await self.hass.config_entries.async_unload(
+                    self.config_entry.entry_id
+                )
+
+            if not unloaded:
+                errors["base"] = "reset_failed"
+            else:
+                cleared: list[str] = []
+                reset_ok = False
+                try:
+                    cleared = await async_reset_imported_history(
+                        self.hass,
+                        self.config_entry,
+                    )
+                    reset_ok = True
+                except Exception:
+                    _LOGGER.exception("Failed to reset Hildebrand Glow imported history")
+                    errors["base"] = "reset_failed"
+
+                if was_loaded:
+                    setup_ok = await self.hass.config_entries.async_setup(
+                        self.config_entry.entry_id
+                    )
+                    if not setup_ok:
+                        errors["base"] = "reload_failed"
+
+                if reset_ok and not errors:
+                    return self.async_abort(
+                        reason="reset_complete",
+                        description_placeholders={"count": str(len(cleared))},
+                    )
+
+        return self.async_show_form(
+            step_id="reset_history",
+            data_schema=vol.Schema({}),
+            errors=errors,
         )

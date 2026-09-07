@@ -28,6 +28,20 @@ Cost history is then extended incrementally every six hours. A trailing complete
 
 For the current partial day, Glow PT30M cost is usage-only. The standing charge appears only after Glow publishes the completed P1D bucket.
 
+## Reset imported history
+
+Version 2.2.0 adds a maintenance action under **Settings → Devices & services → Hildebrand Glow → Configure → Reset imported history**.
+
+The reset is deliberately scoped to the selected Hildebrand meter site. It:
+
+- clears Recorder statistics for the integration's sensor entities;
+- clears the dedicated Hildebrand electricity/gas Energy cost statistics;
+- removes the integration's cumulative-history, cost-history and tariff-ledger cache files;
+- preserves credentials, entity registry entries, dashboard configuration and all unrelated Home Assistant history;
+- reloads the config entry so consumption, cost and tariff history are rebuilt cleanly from Glow.
+
+A confirmation screen is shown before any statistics are deleted. Because the statistic IDs remain stable, the Energy dashboard does not need to be reconfigured after a successful reset; it will repopulate as the backfill completes.
+
 ## Usage cost versus standing charge graph
 
 The integration also imports separate historical statistics for:
