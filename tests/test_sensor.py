@@ -14,6 +14,20 @@ def test_daily_standing_charge_uses_valid_monetary_state_class() -> None:
     assert description["state_class"] == SensorStateClass.TOTAL
 
 
+def test_cost_components_are_stackable_long_term_monetary_sensors() -> None:
+    for key in (
+        "electricity_usage_cost",
+        "electricity_standing_charge",
+        "gas_usage_cost",
+        "gas_standing_charge",
+    ):
+        description = SENSOR_DESCRIPTIONS[key]
+        assert description["device_class"] == SensorDeviceClass.MONETARY
+        assert description["state_class"] == SensorStateClass.TOTAL
+        assert description["native_unit_of_measurement"] == "GBP"
+        assert description["data_key"] == "costs"
+
+
 def test_consumption_sensors_read_from_persisted_cumulative_values() -> None:
     for classifier in (
         CLASSIFIER_ELECTRICITY_CONSUMPTION,
