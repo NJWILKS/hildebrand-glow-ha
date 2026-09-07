@@ -55,6 +55,7 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "readings",
         "reading_key": CLASSIFIER_ELECTRICITY_COST,
         "convert_pence": True,
+        "diagnostic_commodity": "electricity",
     },
     f"{CLASSIFIER_GAS_COST}_api": {
         "name": "Gas Cost (API)",
@@ -65,6 +66,7 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "readings",
         "reading_key": CLASSIFIER_GAS_COST,
         "convert_pence": True,
+        "diagnostic_commodity": "gas",
     },
     "electricity_daily_cost": {
         "name": "Electricity Daily Cost",
@@ -74,6 +76,27 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "electricity",
+        "diagnostic_commodity": "electricity",
+    },
+    "electricity_usage_cost": {
+        "name": "Electricity Usage Cost",
+        "icon": "mdi:flash-outline",
+        "device_class": SensorDeviceClass.MONETARY,
+        "state_class": SensorStateClass.TOTAL,
+        "native_unit_of_measurement": "GBP",
+        "data_key": "costs",
+        "reading_key": "electricity_usage",
+        "diagnostic_commodity": "electricity",
+    },
+    "electricity_standing_charge": {
+        "name": "Electricity Standing Charge",
+        "icon": "mdi:cash-clock",
+        "device_class": SensorDeviceClass.MONETARY,
+        "state_class": SensorStateClass.TOTAL,
+        "native_unit_of_measurement": "GBP",
+        "data_key": "costs",
+        "reading_key": "electricity_standing_charge",
+        "diagnostic_commodity": "electricity",
     },
     "gas_daily_cost": {
         "name": "Gas Daily Cost",
@@ -83,6 +106,27 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "gas",
+        "diagnostic_commodity": "gas",
+    },
+    "gas_usage_cost": {
+        "name": "Gas Usage Cost",
+        "icon": "mdi:fire",
+        "device_class": SensorDeviceClass.MONETARY,
+        "state_class": SensorStateClass.TOTAL,
+        "native_unit_of_measurement": "GBP",
+        "data_key": "costs",
+        "reading_key": "gas_usage",
+        "diagnostic_commodity": "gas",
+    },
+    "gas_standing_charge": {
+        "name": "Gas Standing Charge",
+        "icon": "mdi:cash-clock",
+        "device_class": SensorDeviceClass.MONETARY,
+        "state_class": SensorStateClass.TOTAL,
+        "native_unit_of_measurement": "GBP",
+        "data_key": "costs",
+        "reading_key": "gas_standing_charge",
+        "diagnostic_commodity": "gas",
     },
     "total_daily_cost": {
         "name": "Total Daily Energy Cost",
@@ -196,3 +240,13 @@ class GlowmarktSensor(
                 return round(value, 2)
             return round(value, 3)
         return value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        commodity = self._description.get("diagnostic_commodity")
+        if commodity is None or self.coordinator.data is None:
+            return None
+        diagnostics = self.coordinator.data.get("cost_diagnostics", {}).get(commodity)
+        if not diagnostics:
+            return None
+        return dict(diagnostics)
