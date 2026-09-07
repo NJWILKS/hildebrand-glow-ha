@@ -6,6 +6,7 @@ from custom_components.hildebrand_glow.cost_history import (
     _effective_key,
     build_component_statistics,
     build_total_cost_statistics,
+    energy_cost_statistic_id,
 )
 from custom_components.hildebrand_glow.costing import CostBreakdown
 
@@ -34,8 +35,8 @@ def test_cost_component_statistics_are_daily_stackable_states() -> None:
 
     assert [item["state"] for item in usage] == [3.0, 2.5]
     assert [item["sum"] for item in usage] == [3.0, 5.5]
-    assert [item["state"] for item in standing] == [0.47, 0.0]
-    assert [item["sum"] for item in standing] == [0.47, 0.47]
+    assert [item["state"] for item in standing] == [0.472, 0.0]
+    assert [item["sum"] for item in standing] == [0.472, 0.472]
     assert usage[0]["start"] == datetime(
         2025,
         10,
@@ -74,8 +75,8 @@ def test_total_cost_statistics_are_cumulative_for_energy_dashboard() -> None:
 
     total = build_total_cost_statistics(history)
 
-    assert [item["state"] for item in total] == [1.47, 2.0, 2.5]
-    assert [item["sum"] for item in total] == [1.47, 3.47, 5.97]
+    assert [item["state"] for item in total] == [1.472, 2.0, 2.5]
+    assert [item["sum"] for item in total] == [1.472, 3.472, 5.972]
     assert [item["start"] for item in total[:2]] == [first_hour, second_hour]
     assert total[2]["start"] == datetime(
         2025,
@@ -84,6 +85,37 @@ def test_total_cost_statistics_are_cumulative_for_energy_dashboard() -> None:
         0,
         0,
         tzinfo=timezone.utc,
+    )
+
+
+def test_cost_statistics_preserve_sub_penny_precision() -> None:
+    hour = datetime(2026, 9, 5, 0, 0, tzinfo=timezone.utc)
+    history = [
+        CostBreakdown(
+            day="2026-09-05",
+            total_pence=147.619,
+            usage_pence=100.010,
+            standing_charge_pence=47.609,
+            standing_charge_status="applied",
+            complete_day=True,
+            usage_intervals=((hour, 100.010),),
+        )
+    ]
+
+    total = build_total_cost_statistics(history)
+    usage, standing = build_component_statistics(history)
+
+    assert total[0]["state"] == 1.47619
+    assert total[0]["sum"] == 1.47619
+    assert usage[0]["state"] == 1.0001
+    assert standing[0]["state"] == 0.47609
+    assert usage[0]["state"] + standing[0]["state"] == total[0]["state"]
+
+
+def test_energy_cost_statistic_id_is_stable_and_valid() -> None:
+    assert (
+        energy_cost_statistic_id("ABC-123/site", "Electricity")
+        == "hildebrand_glow:abc_123_site_electricity_energy_cost"
     )
 
 
