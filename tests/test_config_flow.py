@@ -13,6 +13,15 @@ from custom_components.hildebrand_glow.config_flow import (
 from custom_components.hildebrand_glow.const import CONF_VIRTUAL_ENTITY, DOMAIN
 
 
+@pytest.fixture
+def mock_recorder_before_hass(recorder_db_url: str) -> None:
+    """Prepare Recorder database metadata before the hass fixture starts."""
+    # The custom-component pytest plugin requires recorder_db_url to be resolved
+    # before hass marks itself as initialized. The hass fixture depends on this
+    # hook specifically so Recorder-backed tests can establish that ordering.
+    assert recorder_db_url
+
+
 def test_options_flow_factory_does_not_assign_read_only_config_entry() -> None:
     flow = HildebrandGlowConfigFlow.async_get_options_flow(object())
 
