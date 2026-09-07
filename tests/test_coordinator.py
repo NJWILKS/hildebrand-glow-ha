@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from custom_components.hildebrand_glow.api import GlowmarktApiError, UK_TZ
+from custom_components.hildebrand_glow.api import GlowmarktApiError
 from custom_components.hildebrand_glow.const import (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_ELECTRICITY_COST,
