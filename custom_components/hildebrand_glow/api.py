@@ -82,6 +82,13 @@ class GlowmarktApiClient:
             delay = float(2**attempt)
         return min(max(delay, 0.0), API_MAX_BACKOFF_SECONDS)
 
+    def _schedule_retry(self, attempt: int) -> None:
+        delay = min(float(2**attempt), API_MAX_BACKOFF_SECONDS)
+        self._next_request_at = max(
+            self._next_request_at,
+            asyncio.get_running_loop().time() + delay,
+        )
+
     async def _wait_for_request_slot(self) -> None:
         loop = asyncio.get_running_loop()
         delay = self._next_request_at - loop.time()
@@ -146,7 +153,15 @@ class GlowmarktApiClient:
                     f"Authentication request failed: HTTP {err.status}"
                 ) from err
             except ClientError as err:
-                raise GlowmarktApiError(f"Connection error: {err}") from err
+                if attempt >= API_MAX_RETRIES:
+                    raise GlowmarktApiError(
+                        "Authentication connection failed after retries"
+                    ) from err
+                self._schedule_retry(attempt)
+                _LOGGER.warning(
+                    "Glowmarkt authentication connection dropped; retrying with backoff"
+                )
+                continue
 
         raise GlowmarktApiError("Authentication retries exhausted")
 
@@ -211,7 +226,15 @@ class GlowmarktApiClient:
                     f"Glowmarkt request failed: HTTP {err.status}"
                 ) from err
             except ClientError as err:
-                raise GlowmarktApiError(f"Glowmarkt connection error: {err}") from err
+                if attempt >= API_MAX_RETRIES:
+                    raise GlowmarktApiError(
+                        "Glowmarkt connection failed after retries"
+                    ) from err
+                self._schedule_retry(attempt)
+                _LOGGER.warning(
+                    "Glowmarkt connection dropped; retrying with backoff"
+                )
+                continue
 
         raise GlowmarktApiError("Glowmarkt request retries exhausted")
 
