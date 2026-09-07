@@ -26,6 +26,16 @@ def test_cost_components_are_stackable_long_term_monetary_sensors() -> None:
         assert description["state_class"] == SensorStateClass.TOTAL
         assert description["native_unit_of_measurement"] == "GBP"
         assert description["data_key"] == "costs"
+        assert description["daily_reset"] is True
+
+
+def test_daily_cost_sensors_expose_reset_boundaries_for_recorder() -> None:
+    for key in ("electricity_daily_cost", "gas_daily_cost"):
+        description = SENSOR_DESCRIPTIONS[key]
+        assert description["device_class"] == SensorDeviceClass.MONETARY
+        assert description["state_class"] == SensorStateClass.TOTAL
+        assert description["daily_reset"] is True
+        assert description["diagnostic_commodity"] in ("electricity", "gas")
 
 
 def test_consumption_sensors_read_from_persisted_cumulative_values() -> None:
