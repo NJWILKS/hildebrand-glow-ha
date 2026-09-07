@@ -25,7 +25,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import GlowmarktDataUpdateCoordinator
-from .cost_history import async_backfill_cost_history
+from .cost_history import async_cost_history_worker
 from .identity import sensor_unique_id, site_identity
 
 SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
@@ -174,10 +174,11 @@ async def async_setup_entry(
         for sensor_key, description in SENSOR_DESCRIPTIONS.items()
     ]
     async_add_entities(entities)
-    hass.async_create_task(
-        async_backfill_cost_history(hass, coordinator, site_id),
-        name=f"{DOMAIN} cost history backfill",
+    cost_history_task = hass.async_create_task(
+        async_cost_history_worker(hass, coordinator, site_id),
+        name=f"{DOMAIN} cost history worker",
     )
+    config_entry.async_on_unload(cost_history_task.cancel)
 
 
 class GlowmarktSensor(
