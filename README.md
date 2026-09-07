@@ -79,13 +79,13 @@ The test suite includes a privacy-safe oracle derived from a contributed real Br
 The protected live test uses repository environment credentials and verifies:
 
 - Glowmarkt `first-time` still locates the known historical neighbourhood;
-- the PT30M readings endpoint resolves an actual first available interval at or after that locator;
+- the PT30M readings endpoint resolves an actual first available interval near that locator;
 - `last-time` has not regressed behind the known export;
-- stable historical PT30M slices still match known data across both UK DST transitions and a recent completed day.
+- known completed days retain the exact expected half-hour timestamp geometry, including **50** intervals on the autumn DST day and **46** on the spring DST day.
 
-The first exported day is **not** treated as immutable because live testing proved the earliest historic rows can be revised or disappear while `first-time` metadata remains unchanged.
+The contributed CSV is a historical snapshot, not an immutable billing ledger. Live testing proved that Glowmarkt can revise or remove old consumption values while preserving the same timestamp geometry and `first-time` metadata. The **current PT30M readings API is therefore authoritative for consumption values**; old CSV totals and value fingerprints are useful evidence, but they are not release gates.
 
-The live job compares counts, totals and SHA-256 fingerprints without printing raw household readings or credentials to Actions logs. It is **manual-only** and runs separately from normal pull-request CI.
+The live job checks boundaries and timestamp geometry without printing raw household readings or credentials to Actions logs. It is **manual-only** and runs separately from normal pull-request CI.
 
 See [docs/TESTING.md](docs/TESTING.md) for the test strategy and live-contract rules.
 
