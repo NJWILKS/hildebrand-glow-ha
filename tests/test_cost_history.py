@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from custom_components.hildebrand_glow.cost_history import (
     _effective_key,
     build_component_statistics,
+    build_total_cost_statistics,
 )
 from custom_components.hildebrand_glow.costing import CostBreakdown
 
@@ -40,6 +41,47 @@ def test_cost_component_statistics_are_daily_stackable_states() -> None:
         10,
         25,
         23,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+
+def test_total_cost_statistics_are_cumulative_for_energy_dashboard() -> None:
+    first_hour = datetime(2025, 10, 25, 23, 0, tzinfo=timezone.utc)
+    second_hour = datetime(2025, 10, 26, 0, 0, tzinfo=timezone.utc)
+    history = [
+        CostBreakdown(
+            day="2025-10-26",
+            total_pence=347.2,
+            usage_pence=300.0,
+            standing_charge_pence=47.2,
+            standing_charge_status="applied",
+            complete_day=True,
+            usage_intervals=(
+                (first_hour, 100.0),
+                (second_hour, 200.0),
+            ),
+        ),
+        CostBreakdown(
+            day="2025-10-27",
+            total_pence=250.0,
+            usage_pence=250.0,
+            standing_charge_pence=0.0,
+            standing_charge_status="not_applied",
+            complete_day=True,
+        ),
+    ]
+
+    total = build_total_cost_statistics(history)
+
+    assert [item["state"] for item in total] == [1.47, 2.0, 2.5]
+    assert [item["sum"] for item in total] == [1.47, 3.47, 5.97]
+    assert [item["start"] for item in total[:2]] == [first_hour, second_hour]
+    assert total[2]["start"] == datetime(
+        2025,
+        10,
+        27,
+        0,
         0,
         tzinfo=timezone.utc,
     )
