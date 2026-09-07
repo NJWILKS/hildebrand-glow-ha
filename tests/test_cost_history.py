@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from custom_components.hildebrand_glow.api import UK_TZ
 from custom_components.hildebrand_glow.cost_history import (
     _effective_key,
+    _external_resume_point,
     build_component_statistics,
     build_total_cost_statistics,
     energy_cost_statistic_id,
@@ -117,6 +119,27 @@ def test_energy_cost_statistic_id_is_stable_and_valid() -> None:
         energy_cost_statistic_id("ABC-123/site", "Electricity")
         == "hildebrand_glow:abc_123_site_electricity_energy_cost"
     )
+
+
+def test_external_cost_resume_uses_recorder_sum_and_next_uk_day() -> None:
+    last_hour = datetime(2026, 9, 5, 22, 0, tzinfo=timezone.utc)
+
+    start_uk, baseline = _external_resume_point(
+        {
+            "start": last_hour.timestamp(),
+            "sum": 718.40123449,
+        }
+    )
+
+    assert start_uk == datetime(2026, 9, 6, 0, 0, tzinfo=UK_TZ)
+    assert baseline == 718.401234
+
+
+def test_external_cost_resume_without_recorder_row_forces_full_history() -> None:
+    start_uk, baseline = _external_resume_point(None)
+
+    assert start_uk is None
+    assert baseline == 0.0
 
 
 def test_unknown_standing_charge_does_not_invent_historical_value() -> None:

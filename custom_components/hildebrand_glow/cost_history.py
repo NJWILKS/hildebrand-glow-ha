@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
@@ -15,6 +16,7 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     async_import_statistics,
+    get_last_statistics,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
@@ -38,7 +40,7 @@ from .tariff import (
 
 _LOGGER = logging.getLogger(__name__)
 COST_HISTORY_STORAGE_VERSION = 1
-COST_BACKFILL_SCHEMA_VERSION = 4
+COST_BACKFILL_SCHEMA_VERSION = 5
 TARIFF_HISTORY_STORAGE_VERSION = 1
 INITIAL_DELAY_SECONDS = 30
 ENTITY_WAIT_RETRIES = 6
@@ -243,6 +245,62 @@ def _trim_trailing_pending(history: list[CostBreakdown]) -> list[CostBreakdown]:
     return settled
 
 
+async def _clear_statistics(hass: HomeAssistant, statistic_ids: list[str]) -> None:
+    """Clear integration-owned statistics and wait for Recorder to finish."""
+    if not statistic_ids:
+        return
+    done = asyncio.Event()
+
+    def _done() -> None:
+        hass.loop.call_soon_threadsafe(done.set)
+
+    get_instance(hass).async_clear_statistics(statistic_ids, on_done=_done)
+    await done.wait()
+
+
+async def _last_external_stat(
+    hass: HomeAssistant,
+    statistic_id: str,
+) -> dict[str, Any] | None:
+    """Read the last persisted external statistic directly from Recorder."""
+    last = await get_instance(hass).async_add_executor_job(
+        get_last_statistics,
+        hass,
+        1,
+        statistic_id,
+        True,
+        {"sum"},
+    )
+    rows = last.get(statistic_id) if last else None
+    return rows[0] if rows else None
+
+
+def _external_resume_point(
+    last_stat: dict[str, Any] | None,
+) -> tuple[datetime | None, float]:
+    """Return next UK-local day and cumulative sum from Recorder's last row."""
+    if not last_stat:
+        return None, 0.0
+
+    sum_value = last_stat.get("sum")
+    baseline = _round_stat(float(sum_value)) if sum_value is not None else 0.0
+    start = last_stat.get("start")
+    if start is None:
+        return None, baseline
+
+    last_local = datetime.fromtimestamp(
+        float(start),
+        tz=timezone.utc,
+    ).astimezone(UK_TZ)
+    next_day = last_local.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    ) + timedelta(days=1)
+    return next_day, baseline
+
+
 async def _load_tariff_ledger(hass: HomeAssistant, site_id: str) -> dict[str, Any]:
     store = Store(
         hass,
@@ -309,13 +367,21 @@ async def _sync_cost_statistics(
             )
             return
 
+        external_id = energy_cost_statistic_id(site_id, commodity)
         previous = commodity_state.get(commodity, {}) if not full_backfill else {}
-        last_day = previous.get("last_day")
-        start_uk = (
-            _next_day_start_uk(str(last_day))
-            if last_day and not full_backfill
-            else None
-        )
+        rebuild_external = full_backfill
+        total_baseline = 0.0
+        start_uk: datetime | None = None
+
+        if not rebuild_external:
+            last_external = await _last_external_stat(hass, external_id)
+            start_uk, total_baseline = _external_resume_point(last_external)
+            if last_external is None:
+                rebuild_external = True
+                previous = {}
+                start_uk = None
+                total_baseline = 0.0
+
         history = await get_cost_history(
             coordinator.api_client,
             resource["resource_id"],
@@ -339,7 +405,6 @@ async def _sync_cost_statistics(
         tariff_analysis[commodity] = [tariff_period_as_dict(item) for item in periods]
         history = normalise_cost_history(history, periods)
 
-        total_baseline = float(previous.get("total_sum_gbp", 0.0))
         usage_baseline = float(previous.get("usage_sum_gbp", 0.0))
         standing_baseline = float(previous.get("standing_sum_gbp", 0.0))
 
@@ -354,6 +419,8 @@ async def _sync_cost_statistics(
         )
 
         if total_stats:
+            if rebuild_external:
+                await _clear_statistics(hass, [external_id])
             async_import_statistics(hass, _metadata(daily_entity), total_stats)
             async_add_external_statistics(
                 hass,
