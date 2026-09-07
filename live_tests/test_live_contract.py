@@ -14,7 +14,8 @@ from custom_components.hildebrand_glow.const import (
     CLASSIFIER_ELECTRICITY_COST,
     GLOWMARKT_API_BASE,
 )
-from custom_components.hildebrand_glow.costing import _window_total
+from custom_components.hildebrand_glow.costing import get_cost_history, _window_total
+from custom_components.hildebrand_glow.tariff import derive_tariff_periods
 
 pytestmark = pytest.mark.live
 
@@ -160,3 +161,43 @@ async def test_live_account_matches_known_electricity_export() -> None:
         tariff_rows = tariff.get("data")
         if not isinstance(tariff_rows, list) or not tariff_rows:
             pytest.fail("Live contract: tariff-list returned no effective-dated tariff history")
+
+        # A standing charge is stable within one effective tariff period even
+        # though P1D-minus-summed-PT30M residuals wobble because the aggregations
+        # carry different rounding precision. Validate that production period
+        # resolution finds an explicit tariff standing charge close to the centre
+        # of a recent residual cluster, without logging the household tariff.
+        recent_start = datetime.now(UK_TZ) - timedelta(days=35)
+        recent_history = await get_cost_history(
+            client,
+            cost_resource_id,
+            start_uk=recent_start,
+        )
+        periods = derive_tariff_periods(
+            [row for row in tariff_rows if isinstance(row, dict)],
+            recent_history,
+        )
+        candidates = [
+            period
+            for period in periods
+            if period.standing_source == "tariff_list"
+            and period.standing_pence is not None
+            and period.residual_median_pence is not None
+            and period.sample_days >= 5
+        ]
+        if not candidates:
+            pytest.fail(
+                "Live contract: no recent tariff period had enough standing-charge evidence"
+            )
+        calibrated = max(candidates, key=lambda period: period.sample_days)
+        tolerance = max(15.0, 6.0 * float(calibrated.residual_mad_pence or 0.0))
+        if (
+            abs(
+                float(calibrated.standing_pence)
+                - float(calibrated.residual_median_pence)
+            )
+            > tolerance
+        ):
+            pytest.fail(
+                "Live contract: tariff standing charge did not match residual cluster"
+            )
