@@ -25,6 +25,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import GlowmarktDataUpdateCoordinator
+from .cost_history import async_backfill_cost_history
 from .identity import sensor_unique_id, site_identity
 
 SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
@@ -173,6 +174,10 @@ async def async_setup_entry(
         for sensor_key, description in SENSOR_DESCRIPTIONS.items()
     ]
     async_add_entities(entities)
+    hass.async_create_task(
+        async_backfill_cost_history(hass, coordinator, site_id),
+        name=f"{DOMAIN} cost history backfill",
+    )
 
 
 class GlowmarktSensor(
@@ -231,6 +236,15 @@ class GlowmarktSensor(
         reading_key = self._description.get("reading_key", "")
         data_section = self.coordinator.data.get(data_key, {})
         value = data_section.get(reading_key)
+
+        if value is None and reading_key in ("electricity_usage", "gas_usage"):
+            commodity = reading_key.removesuffix("_usage")
+            value = (
+                self.coordinator.data.get("cost_diagnostics", {})
+                .get(commodity, {})
+                .get("usage_cost_gbp")
+            )
+
         if value is None:
             return None
         if self._description.get("convert_pence", False):
