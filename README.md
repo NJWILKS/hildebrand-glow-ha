@@ -8,11 +8,11 @@ A maintained rescue fork of the Home Assistant integration for UK SMETS2 smart m
 ## What this fork adds
 
 - **Full historical electricity and gas consumption import** into Home Assistant Recorder statistics using the original half-hour timestamps.
-- **Authoritative history discovery** using Glowmarkt `first-time` rather than an arbitrary look-back limit.
+- **Full-history discovery without an arbitrary look-back limit**: Glowmarkt `first-time` is used as a cheap locator, then the PT30M readings endpoint determines the first actual billing interval.
 - **DST-safe PT30M history retrieval** in bounded chunks suitable for the Glowmarkt API.
 - **Multi-site Bright account support** with explicit meter-site selection.
 - **Stable entity identity** that prefers the real Glow resource ID, so re-adding a site does not create a new logical meter unnecessarily.
-- **API resilience**: one paced request lane, `Retry-After` support, bounded retries for HTTP 429 and transient 5xx failures, and real API failures are never interpreted as an empty history boundary.
+- **API resilience**: one paced request lane, `Retry-After` support, bounded retries for HTTP 429, transient 5xx responses and transient connection drops. API failures are never interpreted as an empty history boundary.
 - **Lower API pressure**: consumption defaults to 15-minute polling; API-derived cost resources default to 60 minutes; both are configurable with a 5-minute minimum.
 - **Non-blocking history backfill** so Home Assistant setup is not held open while historical data is retrieved.
 - **Home Assistant validation and regression CI** with pytest, Ruff, Hassfest and HACS validation.
@@ -28,7 +28,7 @@ A maintained rescue fork of the Home Assistant integration for UK SMETS2 smart m
 5. Restart Home Assistant.
 6. Go to **Settings → Devices & Services → Add Integration** and search for **Hildebrand Glow**.
 
-For a clean acceptance test, install this fork only; do not keep a second copy of the abandoned integration under the same `hildebrand_glow` domain.
+For a clean acceptance test, install this fork only; do not keep a second copy of another integration under the same `hildebrand_glow` domain.
 
 ## Configuration
 
@@ -52,12 +52,19 @@ The consumption sensors are cumulative `TOTAL_INCREASING` energy sensors for Hom
 
 On a fresh install the integration:
 
-1. asks Glowmarkt for the resource's authoritative first available timestamp;
-2. retrieves all complete history from that boundary to today in DST-safe PT30M chunks;
-3. imports the hourly statistics in the background;
-4. stores the cumulative day boundary so restarts do not add the same completed day twice.
+1. asks Glowmarkt `first-time` for an approximate start locator;
+2. queries a small PT30M window around that locator and treats the earliest non-null reading as the real start of available billing history;
+3. retrieves all complete history from that resolved boundary to today in DST-safe PT30M chunks;
+4. imports the hourly statistics in the background;
+5. stores cumulative day state so restarts do not add the same completed day twice.
 
-The current incomplete UK-local day is not treated as completed historical data. If Glowmarkt temporarily fails or rate-limits a request, the backfill fails safely and can retry rather than recording a false end-of-history marker.
+A genuine `0.0` reading counts as data. Missing/null readings do not. The current incomplete UK-local day is not treated as completed historical data.
+
+`first-time` is deliberately **not** treated as authoritative consumption data. Live testing showed that Glowmarkt metadata can continue to point at historical intervals which the readings endpoint no longer returns. The PT30M readings endpoint therefore decides which intervals actually exist for billing/history purposes.
+
+If Glowmarkt temporarily fails, disconnects or rate-limits a request, the integration retries with bounded backoff. A failed request is never converted into a false end-of-history marker.
+
+For implementation detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Sensors
 
@@ -67,21 +74,28 @@ Glow/Bright DCC data is not real-time and can arrive a day or more late. The coo
 
 ## Real-data regression contract
 
-The test suite includes a privacy-safe oracle derived from a contributed real Bright electricity export containing **19,346 consecutive half-hour readings** across 404 UK-local days. The raw household CSV is not stored in the repository.
+The test suite includes a privacy-safe oracle derived from a contributed real Bright electricity export containing **19,346 half-hour readings** across 404 UK-local days. The raw household CSV is not stored in the repository.
 
 The protected live test uses repository environment credentials and verifies:
 
-- Glowmarkt `first-time` agrees with the known historical boundary;
+- Glowmarkt `first-time` still locates the known historical neighbourhood;
+- the PT30M readings endpoint resolves an actual first available interval at or after that locator;
 - `last-time` has not regressed behind the known export;
-- immutable historical PT30M data still matches the known first day, both UK DST transitions, and the last complete exported day.
+- stable historical PT30M slices still match known data across both UK DST transitions and a recent completed day.
 
-The live job compares counts, totals and SHA-256 fingerprints without printing the raw household readings or credentials to Actions logs.
+The first exported day is **not** treated as immutable because live testing proved the earliest historic rows can be revised or disappear while `first-time` metadata remains unchanged.
+
+The live job compares counts, totals and SHA-256 fingerprints without printing raw household readings or credentials to Actions logs. It is **manual-only** and runs separately from normal pull-request CI.
+
+See [docs/TESTING.md](docs/TESTING.md) for the test strategy and live-contract rules.
 
 ## Development
 
 Normal pull-request CI never uses Bright credentials. It runs mocked/unit tests, Ruff, Hassfest and HACS validation. The protected live contract is separate and uses the `glow-live` GitHub Environment.
 
-Bug fixes should arrive with a regression test. Historical/cumulative energy changes require particular care around duplicate imports, restart behaviour, missing readings, UK-local day boundaries and DST.
+Bug fixes should arrive with a regression test. Historical/cumulative energy changes require particular care around duplicate imports, restart behaviour, missing readings, UK-local day boundaries, DST and API revisions.
+
+Repository/agent maintenance rules are documented in [AGENTS.md](AGENTS.md).
 
 ## Acknowledgements
 
