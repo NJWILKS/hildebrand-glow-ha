@@ -1,15 +1,40 @@
 {
+  "source_file": "electricity consumption-2026-09-06T17_21_13.csv",
+  "source_sha256": "e70bb156e644b0d340694e111715f82d14979834bebd100f29a6f6dd6760ebf4",
+  "canonical_intervals_sha256": "47da63e3c09373fbbb5d8e58300ba6d618b664dcac3e3de55e1f45e497ce347b",
   "source_rows": 19346,
   "source_total_kwh": 7646.171,
   "zero_readings": 1,
+  "first_epoch_utc": 1753830000,
+  "last_epoch_utc": 1788651000,
   "uk_local_start": "2025-07-30T00:00:00+01:00",
   "uk_local_end": "2026-09-06T00:30:00+01:00",
   "uk_local_days": 404,
   "known_days": {
-    "2025-07-30": {"intervals": 48, "kwh": 22.026},
-    "2025-10-26": {"intervals": 50, "kwh": 20.989},
-    "2026-03-29": {"intervals": 46, "kwh": 24.096},
-    "2026-09-05": {"intervals": 48, "kwh": 11.373},
-    "2026-09-06": {"intervals": 2, "kwh": 0.307}
+    "2025-07-30": {
+      "intervals": 48,
+      "kwh": 22.026,
+      "sha256": "27eb7aee280720a668963fa4eaa8e530f3fefe63f875af39fcd9967443ecc011"
+    },
+    "2025-10-26": {
+      "intervals": 50,
+      "kwh": 20.989,
+      "sha256": "31e5360a5e1c06c46f31558fc43fa8079edeef41af72afb7952799eaa3e548da"
+    },
+    "2026-03-29": {
+      "intervals": 46,
+      "kwh": 24.096,
+      "sha256": "eaf06c60b7e981638ae375573cb830d8678901839b61a9d247cd1f313d95e694"
+    },
+    "2026-09-05": {
+      "intervals": 48,
+      "kwh": 11.373,
+      "sha256": "01ed8124e0f1716d9832993ca93b5ab9fd5bea04fe8db3e0476f223c79879048"
+    },
+    "2026-09-06": {
+      "intervals": 2,
+      "kwh": 0.307,
+      "sha256": "8f4e59ac6f7d8f7a61d1bfb6ec2241f386706063060cb06ef8bb3b228cee556d"
+    }
   }
 }

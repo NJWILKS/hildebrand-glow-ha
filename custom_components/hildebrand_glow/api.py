@@ -16,15 +16,24 @@ from .const import GLOWMARKT_API_BASE, GLOWMARKT_APP_ID
 _LOGGER = logging.getLogger(__name__)
 UK_TZ = ZoneInfo("Europe/London")
 
-# Glowmarkt returns Unix timestamps. Scanning to the Unix epoch gives us a
-# deterministic lower boundary without imposing an arbitrary history horizon.
-UNIX_EPOCH_YEAR = 1970
-
 # Hildebrand documents a maximum PT30M query span of 10 days. Use nine UK-local
 # calendar days so a 25-hour autumn DST day can never make the UTC span exceed
 # that API limit.
 HISTORY_INTERVAL_DAYS = 9
-HISTORY_MAX_RETRIES = 4
+
+# first-time is useful as a cheap locator, but the readings endpoint is the
+# authoritative source for billable intervals. Search a small bounded window
+# around that locator to establish the first actual reading.
+FIRST_READING_SEARCH_DAYS = 3
+
+# Keep all requests for one Bright account in a single, paced lane. This prevents
+# normal polling and a history backfill from producing a burst of concurrent API
+# calls. 429 and transient server responses additionally honour Retry-After when
+# supplied and otherwise use bounded exponential backoff.
+API_MAX_RETRIES = 4
+API_MIN_REQUEST_SPACING_SECONDS = 0.5
+API_MAX_BACKOFF_SECONDS = 30.0
+TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
 @dataclass
@@ -60,32 +69,101 @@ class GlowmarktApiClient:
         self._token_expiry: datetime | None = None
         self._virtual_entity_id: str | None = None
         self._resources: dict[str, dict[str, Any]] = {}
+        self._request_lock = asyncio.Lock()
+        self._next_request_at = 0.0
+
+    @staticmethod
+    def _retry_delay(response: Any, attempt: int) -> float:
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = headers.get("Retry-After")
+        try:
+            delay = float(retry_after) if retry_after is not None else float(2**attempt)
+        except (TypeError, ValueError):
+            delay = float(2**attempt)
+        return min(max(delay, 0.0), API_MAX_BACKOFF_SECONDS)
+
+    def _schedule_retry(self, attempt: int) -> None:
+        delay = min(float(2**attempt), API_MAX_BACKOFF_SECONDS)
+        self._next_request_at = max(
+            self._next_request_at,
+            asyncio.get_running_loop().time() + delay,
+        )
+
+    async def _wait_for_request_slot(self) -> None:
+        loop = asyncio.get_running_loop()
+        delay = self._next_request_at - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        self._next_request_at = loop.time() + API_MIN_REQUEST_SPACING_SECONDS
 
     async def authenticate(self) -> bool:
+        """Authenticate with bounded retry/backoff for rate limits and server errors."""
         headers = {
             "Content-Type": "application/json",
             "applicationId": GLOWMARKT_APP_ID,
         }
         payload = {"username": self._username, "password": self._password}
-        try:
-            async with self._session.post(
-                f"{GLOWMARKT_API_BASE}/auth",
-                headers=headers,
-                json=payload,
-            ) as response:
-                if response.status == 401:
-                    raise GlowmarktAuthError("Invalid username or password")
-                response.raise_for_status()
-                data = await response.json()
-                if data.get("valid"):
+
+        for attempt in range(API_MAX_RETRIES + 1):
+            try:
+                async with self._request_lock:
+                    await self._wait_for_request_slot()
+                    async with self._session.post(
+                        f"{GLOWMARKT_API_BASE}/auth",
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        if response.status == 401:
+                            raise GlowmarktAuthError("Invalid username or password")
+
+                        if response.status in TRANSIENT_HTTP_STATUSES:
+                            if attempt >= API_MAX_RETRIES:
+                                raise GlowmarktApiError(
+                                    "Glowmarkt authentication temporarily unavailable"
+                                )
+                            delay = self._retry_delay(response, attempt)
+                            self._next_request_at = max(
+                                self._next_request_at,
+                                asyncio.get_running_loop().time() + delay,
+                            )
+                            _LOGGER.warning(
+                                "Glowmarkt temporarily rejected authentication; "
+                                "retrying with backoff"
+                            )
+                            continue
+
+                        if response.status >= 400:
+                            raise GlowmarktAuthError(
+                                f"Authentication failed with HTTP {response.status}"
+                            )
+
+                        data = await response.json()
+
+                if data.get("valid") and data.get("token"):
                     self._token = data["token"]
                     self._token_expiry = datetime.now() + timedelta(days=6)
                     return True
                 raise GlowmarktAuthError("Authentication failed: invalid response")
-        except ClientResponseError as err:
-            raise GlowmarktAuthError(f"Authentication failed: {err}") from err
-        except ClientError as err:
-            raise GlowmarktApiError(f"Connection error: {err}") from err
+            except GlowmarktAuthError:
+                raise
+            except GlowmarktApiError:
+                raise
+            except ClientResponseError as err:
+                raise GlowmarktApiError(
+                    f"Authentication request failed: HTTP {err.status}"
+                ) from err
+            except ClientError as err:
+                if attempt >= API_MAX_RETRIES:
+                    raise GlowmarktApiError(
+                        "Authentication connection failed after retries"
+                    ) from err
+                self._schedule_retry(attempt)
+                _LOGGER.warning(
+                    "Glowmarkt authentication connection dropped; retrying with backoff"
+                )
+                continue
+
+        raise GlowmarktApiError("Authentication retries exhausted")
 
     async def _ensure_authenticated(self) -> None:
         if (
@@ -102,20 +180,68 @@ class GlowmarktApiClient:
             "token": self._token or "",
         }
 
+    async def _get_json(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        allow_not_found: bool = False,
+    ) -> Any | None:
+        """GET JSON through the shared paced lane with bounded transient retries."""
+        for attempt in range(API_MAX_RETRIES + 1):
+            try:
+                async with self._request_lock:
+                    await self._wait_for_request_slot()
+                    async with self._session.get(
+                        url,
+                        headers=self._get_headers(),
+                        params=params,
+                    ) as response:
+                        if response.status == 404 and allow_not_found:
+                            return None
+
+                        if response.status in TRANSIENT_HTTP_STATUSES:
+                            if attempt >= API_MAX_RETRIES:
+                                raise GlowmarktApiError(
+                                    "Glowmarkt request failed after retries: "
+                                    f"HTTP {response.status}"
+                                )
+                            delay = self._retry_delay(response, attempt)
+                            self._next_request_at = max(
+                                self._next_request_at,
+                                asyncio.get_running_loop().time() + delay,
+                            )
+                            _LOGGER.warning(
+                                "Glowmarkt request rate-limited or temporarily "
+                                "unavailable; retrying with backoff"
+                            )
+                            continue
+
+                        response.raise_for_status()
+                        return await response.json()
+            except GlowmarktApiError:
+                raise
+            except ClientResponseError as err:
+                raise GlowmarktApiError(
+                    f"Glowmarkt request failed: HTTP {err.status}"
+                ) from err
+            except ClientError as err:
+                if attempt >= API_MAX_RETRIES:
+                    raise GlowmarktApiError(
+                        "Glowmarkt connection failed after retries"
+                    ) from err
+                self._schedule_retry(attempt)
+                _LOGGER.warning(
+                    "Glowmarkt connection dropped; retrying with backoff"
+                )
+                continue
+
+        raise GlowmarktApiError("Glowmarkt request retries exhausted")
+
     async def get_virtual_entities(self) -> list[dict[str, Any]]:
         await self._ensure_authenticated()
-        try:
-            async with self._session.get(
-                f"{GLOWMARKT_API_BASE}/virtualentity",
-                headers=self._get_headers(),
-            ) as response:
-                response.raise_for_status()
-                data = await response.json()
-                return data if isinstance(data, list) else []
-        except ClientError as err:
-            raise GlowmarktApiError(
-                f"Failed to get virtual entities: {err}"
-            ) from err
+        data = await self._get_json(f"{GLOWMARKT_API_BASE}/virtualentity")
+        return data if isinstance(data, list) else []
 
     async def discover_resources(
         self,
@@ -134,26 +260,54 @@ class GlowmarktApiClient:
 
         self._resources = {}
         for ve_id in ve_ids:
-            try:
-                async with self._session.get(
-                    f"{GLOWMARKT_API_BASE}/virtualentity/{ve_id}/resources",
-                    headers=self._get_headers(),
-                ) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-                    for resource in data.get("resources", []):
-                        resource_id = resource.get("resourceId")
-                        classifier = resource.get("classifier")
-                        if resource_id and classifier:
-                            self._resources[classifier] = {
-                                "resource_id": resource_id,
-                                "name": resource.get("name", classifier),
-                                "classifier": classifier,
-                                "base_unit": resource.get("baseUnit", ""),
-                            }
-            except ClientError as err:
-                _LOGGER.error("Failed to get resources for %s: %s", ve_id, err)
+            data = await self._get_json(
+                f"{GLOWMARKT_API_BASE}/virtualentity/{ve_id}/resources"
+            )
+            if not isinstance(data, dict):
+                continue
+            for resource in data.get("resources", []):
+                resource_id = resource.get("resourceId")
+                classifier = resource.get("classifier")
+                if resource_id and classifier:
+                    self._resources[classifier] = {
+                        "resource_id": resource_id,
+                        "name": resource.get("name", classifier),
+                        "classifier": classifier,
+                        "base_unit": resource.get("baseUnit", ""),
+                    }
         return self._resources
+
+    async def get_first_reading_time(self, resource_id: str) -> datetime | None:
+        """Return Glowmarkt's approximate UTC start time for a resource."""
+        await self._ensure_authenticated()
+        data = await self._get_json(
+            f"{GLOWMARKT_API_BASE}/resource/{resource_id}/first-time",
+            allow_not_found=True,
+        )
+        if data is None:
+            return None
+        if not isinstance(data, dict) or data.get("status") not in (None, "OK"):
+            raise GlowmarktApiError("Glowmarkt first-time query returned an error")
+        first_ts = (data.get("data") or {}).get("firstTs")
+        if first_ts is None:
+            return None
+        return datetime.fromtimestamp(float(first_ts), tz=timezone.utc)
+
+    async def get_last_reading_time(self, resource_id: str) -> datetime | None:
+        """Return the UTC time of the most recent available reading for a resource."""
+        await self._ensure_authenticated()
+        data = await self._get_json(
+            f"{GLOWMARKT_API_BASE}/resource/{resource_id}/last-time",
+            allow_not_found=True,
+        )
+        if data is None:
+            return None
+        if not isinstance(data, dict) or data.get("status") not in (None, "OK"):
+            raise GlowmarktApiError("Glowmarkt last-time query returned an error")
+        last_ts = (data.get("data") or {}).get("lastTs")
+        if last_ts is None:
+            return None
+        return datetime.fromtimestamp(float(last_ts), tz=timezone.utc)
 
     async def _request_readings(
         self,
@@ -162,58 +316,64 @@ class GlowmarktApiClient:
         end: datetime,
         period: str,
     ) -> list[list[Any]]:
-        """Fetch a readings window, retrying 429s but never treating errors as no data."""
+        """Fetch a readings window without interpreting API failures as no data."""
         params = {
             "from": start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             "to": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             "period": period,
             "offset": 0,
             "function": "sum",
+            "nulls": 1,
         }
+        data = await self._get_json(
+            f"{GLOWMARKT_API_BASE}/resource/{resource_id}/readings",
+            params=params,
+        )
+        if not isinstance(data, dict) or data.get("status") != "OK":
+            raise GlowmarktApiError("Glowmarkt readings query returned an error")
+        rows = data.get("data", [])
+        return rows if isinstance(rows, list) else []
 
-        for attempt in range(HISTORY_MAX_RETRIES + 1):
-            try:
-                async with self._session.get(
-                    f"{GLOWMARKT_API_BASE}/resource/{resource_id}/readings",
-                    headers=self._get_headers(),
-                    params=params,
-                ) as response:
-                    if response.status == 429 and attempt < HISTORY_MAX_RETRIES:
-                        headers = getattr(response, "headers", {})
-                        retry_after = headers.get("Retry-After") if headers else None
-                        try:
-                            delay = float(retry_after) if retry_after is not None else 2**attempt
-                        except (TypeError, ValueError):
-                            delay = 2**attempt
-                        _LOGGER.warning(
-                            "Glowmarkt rate limited %s; retrying in %.1fs",
-                            resource_id,
-                            delay,
-                        )
-                        await asyncio.sleep(min(delay, 30.0))
-                        continue
+    async def get_first_available_reading_time(
+        self,
+        resource_id: str,
+    ) -> datetime | None:
+        """Resolve first-time metadata to the first real PT30M billing interval."""
+        locator = await self.get_first_reading_time(resource_id)
+        if locator is None:
+            return None
 
-                    response.raise_for_status()
-                    data = await response.json()
-                    if data.get("status") != "OK":
-                        raise GlowmarktApiError(
-                            f"Readings query failed for {resource_id}: {data.get('status')}"
-                        )
-                    rows = data.get("data", [])
-                    return rows if isinstance(rows, list) else []
-            except ClientResponseError as err:
-                if err.status == 429 and attempt < HISTORY_MAX_RETRIES:
-                    await asyncio.sleep(min(float(2**attempt), 30.0))
-                    continue
-                raise GlowmarktApiError(
-                    f"Readings query failed for {resource_id}: {err}"
-                ) from err
-            except ClientError as err:
-                raise GlowmarktApiError(
-                    f"Readings query failed for {resource_id}: {err}"
-                ) from err
+        search_start_uk = locator.astimezone(UK_TZ).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        search_end_uk = search_start_uk + timedelta(days=FIRST_READING_SEARCH_DAYS)
+        rows = await self._request_readings(
+            resource_id,
+            search_start_uk,
+            search_end_uk,
+            "PT30M",
+        )
 
-        raise GlowmarktApiError(f"Readings query exhausted retries for {resource_id}")
+        available: list[datetime] = []
+        for row in rows:
+            if len(row) <= 1 or row[1] is None:
+                continue
+            timestamp = datetime.fromtimestamp(float(row[0]), tz=timezone.utc)
+            timestamp_uk = timestamp.astimezone(UK_TZ)
+            if search_start_uk <= timestamp_uk < search_end_uk:
+                available.append(timestamp)
+
+        if not available:
+            _LOGGER.warning(
+                "No actual PT30M readings found near Glowmarkt first-time for %s",
+                resource_id,
+            )
+            return None
+
+        return min(available)
 
     async def _fetch_day_reading(
         self,
@@ -222,7 +382,7 @@ class GlowmarktApiClient:
         day_end_uk: datetime,
         days_back: int | None = None,
     ) -> DailyReading | None:
-        """Fetch one explicit UK-local day and return it only when data is real."""
+        """Fetch exactly one UK-local day, excluding any API end-boundary bucket."""
         _LOGGER.debug(
             "Fetching %s (%s) from %s to %s",
             resource_id,
@@ -236,23 +396,29 @@ class GlowmarktApiClient:
             day_end_uk,
             "PT30M",
         )
-        valid = [row for row in rows if len(row) > 1 and row[1] is not None]
-        total = sum(float(row[1]) for row in valid)
-        if total <= 0:
+
+        intervals: list[tuple[datetime, float]] = []
+        for row in rows:
+            if len(row) <= 1 or row[1] is None:
+                continue
+            timestamp = datetime.fromtimestamp(float(row[0]), tz=timezone.utc)
+            timestamp_uk = timestamp.astimezone(UK_TZ)
+            if timestamp_uk < day_start_uk or timestamp_uk >= day_end_uk:
+                continue
+            intervals.append((timestamp, float(row[1])))
+
+        if not intervals:
             return None
 
-        intervals = [
-            (datetime.fromtimestamp(row[0], tz=timezone.utc), float(row[1]))
-            for row in valid
-        ]
+        intervals.sort(key=lambda item: item[0])
         return DailyReading(
             day=day_start_uk.date().isoformat(),
-            value=round(total, 3),
+            value=round(sum(value for _, value in intervals), 3),
             intervals=intervals,
         )
 
     async def get_daily_reading(self, resource_id: str) -> DailyReading | None:
-        """Return the latest completed non-zero day, allowing for API delay."""
+        """Return the latest completed day that contains actual API readings."""
         await self._ensure_authenticated()
         today_start_uk = datetime.now(UK_TZ).replace(
             hour=0,
@@ -273,96 +439,22 @@ class GlowmarktApiClient:
                 return reading
 
         _LOGGER.warning(
-            "No non-zero data found for %s in the last 3 completed days",
+            "No readings found for %s in the last 3 completed days",
             resource_id,
         )
         return None
 
-    @staticmethod
-    def _next_month(value: datetime) -> datetime:
-        if value.month == 12:
-            return value.replace(year=value.year + 1, month=1, day=1)
-        return value.replace(month=value.month + 1, day=1)
-
     async def _find_data_start(self, resource_id: str) -> datetime | None:
-        """Find the first available day by exhaustively probing every API year."""
-        await self._ensure_authenticated()
-        now_utc = datetime.now(timezone.utc)
-        earliest_year: int | None = None
-
-        # P1Y is limited to 366 days, so query one calendar year at a time.
-        # We deliberately scan every year back to the Unix epoch instead of
-        # stopping after N empty windows: a long data gap must not hide older data.
-        for year in range(now_utc.year, UNIX_EPOCH_YEAR - 1, -1):
-            year_start = datetime(year, 1, 1, tzinfo=timezone.utc)
-            year_end = min(
-                datetime(year + 1, 1, 1, tzinfo=timezone.utc),
-                now_utc,
-            )
-            if year_end <= year_start:
-                continue
-            rows = await self._request_readings(
-                resource_id,
-                year_start,
-                year_end,
-                "P1Y",
-            )
-            if any(
-                len(row) > 1 and row[1] is not None and float(row[1]) > 0
-                for row in rows
-            ):
-                earliest_year = year
-
-        if earliest_year is None:
+        """Find the first UK-local day containing an actual PT30M reading."""
+        first_available = await self.get_first_available_reading_time(resource_id)
+        if first_available is None:
             return None
-
-        year_start = datetime(earliest_year, 1, 1, tzinfo=timezone.utc)
-        year_end = datetime(earliest_year + 1, 1, 1, tzinfo=timezone.utc)
-        month_rows = await self._request_readings(
-            resource_id,
-            year_start,
-            year_end,
-            "P1M",
-        )
-        positive_months = [
-            row
-            for row in month_rows
-            if len(row) > 1 and row[1] is not None and float(row[1]) > 0
-        ]
-        if not positive_months:
-            return year_start.astimezone(UK_TZ) - timedelta(days=1)
-
-        earliest_month = datetime.fromtimestamp(
-            min(row[0] for row in positive_months),
-            tz=timezone.utc,
-        ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        month_end = self._next_month(earliest_month)
-        day_rows = await self._request_readings(
-            resource_id,
-            earliest_month,
-            month_end,
-            "P1D",
-        )
-        positive_days = [
-            row
-            for row in day_rows
-            if len(row) > 1 and row[1] is not None and float(row[1]) > 0
-        ]
-        if not positive_days:
-            return earliest_month.astimezone(UK_TZ) - timedelta(days=1)
-
-        earliest_day_utc = datetime.fromtimestamp(
-            min(row[0] for row in positive_days),
-            tz=timezone.utc,
-        )
-        # Aggregate bucket boundaries are UTC here. Begin one UK-local day
-        # earlier so DST/bucket alignment can never omit the first intervals.
-        return earliest_day_utc.astimezone(UK_TZ).replace(
+        return first_available.astimezone(UK_TZ).replace(
             hour=0,
             minute=0,
             second=0,
             microsecond=0,
-        ) - timedelta(days=1)
+        )
 
     async def _fetch_history_chunk(
         self,
@@ -381,7 +473,7 @@ class GlowmarktApiClient:
         for row in rows:
             if len(row) <= 1 or row[1] is None:
                 continue
-            timestamp = datetime.fromtimestamp(row[0], tz=timezone.utc)
+            timestamp = datetime.fromtimestamp(float(row[0]), tz=timezone.utc)
             timestamp_uk = timestamp.astimezone(UK_TZ)
             if timestamp_uk < start_uk or timestamp_uk >= end_uk:
                 continue
@@ -433,15 +525,25 @@ class GlowmarktApiClient:
 
         return [readings_by_day[day] for day in sorted(readings_by_day)]
 
-    async def get_all_readings(self) -> dict[str, DailyReading | None]:
+    async def get_readings(
+        self,
+        classifiers: set[str] | None = None,
+    ) -> dict[str, DailyReading | None]:
+        """Fetch latest completed-day readings for selected discovered resources."""
         if not self._resources:
             await self.discover_resources(self._virtual_entity_id)
         readings: dict[str, DailyReading | None] = {}
         for classifier, resource in self._resources.items():
+            if classifiers is not None and classifier not in classifiers:
+                continue
             readings[classifier] = await self.get_daily_reading(
                 resource["resource_id"]
             )
         return readings
+
+    async def get_all_readings(self) -> dict[str, DailyReading | None]:
+        """Backward-compatible wrapper that fetches all discovered resources."""
+        return await self.get_readings()
 
     async def get_available_readings(
         self,

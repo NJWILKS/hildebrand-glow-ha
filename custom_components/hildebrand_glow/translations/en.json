@@ -4,27 +4,52 @@
       "user": {
         "title": "Hildebrand Glow Account",
         "description": "Enter your Hildebrand Bright app credentials.",
-        "data": {"username": "Email Address", "password": "Password"}
+        "data": {
+          "username": "Email Address",
+          "password": "Password"
+        }
       },
       "select_entity": {
         "title": "Select Your Meter",
         "description": "Select the Bright meter site you want this Home Assistant integration to monitor.",
-        "data": {"virtual_entity_id": "Location"}
+        "data": {
+          "virtual_entity_id": "Location"
+        }
       },
       "tariff": {
         "title": "Energy Tariff Configuration",
         "description": "Enter your energy tariff rates. These can be changed later.",
-        "data": {"electricity_rate": "Electricity Rate (£/kWh)", "electricity_standing_charge": "Electricity Standing Charge (£/day)", "gas_rate": "Gas Rate (£/kWh)", "gas_standing_charge": "Gas Standing Charge (£/day)"}
+        "data": {
+          "electricity_rate": "Electricity Rate (£/kWh)",
+          "electricity_standing_charge": "Electricity Standing Charge (£/day)",
+          "gas_rate": "Gas Rate (£/kWh)",
+          "gas_standing_charge": "Gas Standing Charge (£/day)"
+        }
       }
     },
-    "error": {"invalid_auth": "Invalid username or password.", "cannot_connect": "Unable to connect to the Glowmarkt API.", "no_resources": "No smart meter resources found for this location.", "unknown": "An unexpected error occurred."},
-    "abort": {"already_configured": "This account is already configured."}
+    "error": {
+      "invalid_auth": "Invalid username or password.",
+      "cannot_connect": "Unable to connect to the Glowmarkt API.",
+      "no_resources": "No smart meter resources found for this location.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This account and meter site are already configured."
+    }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Update Tariff Configuration",
-        "data": {"electricity_rate": "Electricity Rate (£/kWh)", "electricity_standing_charge": "Electricity Standing Charge (£/day)", "gas_rate": "Gas Rate (£/kWh)", "gas_standing_charge": "Gas Standing Charge (£/day)"}
+        "title": "Hildebrand Glow Settings",
+        "description": "Change tariff values and API polling intervals. Polling below 5 minutes is blocked to protect the Glowmarkt API.",
+        "data": {
+          "electricity_rate": "Electricity Rate (£/kWh)",
+          "electricity_standing_charge": "Electricity Standing Charge (£/day)",
+          "gas_rate": "Gas Rate (£/kWh)",
+          "gas_standing_charge": "Gas Standing Charge (£/day)",
+          "consumption_interval_minutes": "Consumption refresh interval (minutes)",
+          "api_cost_interval_minutes": "API cost refresh interval (minutes)"
+        }
       }
     }
   }

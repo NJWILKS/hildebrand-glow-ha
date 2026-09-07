@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   live:
-    name: Live API smoke test
+    name: Live API contract test
     runs-on: ubuntu-latest
     environment: glow-live
     steps:
@@ -22,8 +22,9 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Run protected live test
+      - name: Verify protected live Glowmarkt contract
         env:
           GLOWMARKT_USERNAME: ${{ secrets.GLOWMARKT_USERNAME }}
           GLOWMARKT_PASSWORD: ${{ secrets.GLOWMARKT_PASSWORD }}
-        run: pytest -m live tests/live
+          PYTHONPATH: .
+        run: pytest -p no:homeassistant -m live live_tests

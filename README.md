@@ -1,113 +1,104 @@
-# Hildebrand Glow (Bright App) Integration for Home Assistant
+# Hildebrand Glow (Bright App) for Home Assistant
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/v/release/McDon22/hildebrand-glow-ha)](https://github.com/McDon22/hildebrand-glow-ha/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![HACS](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Home Assistant custom integration for UK SMETS2 smart meters using the Hildebrand Glow / Bright app API.
+A maintained rescue fork of the Home Assistant integration for UK SMETS2 smart meters using the Hildebrand Glow / Bright API.
 
-## Features
+## What this fork adds
 
-- **Easy Setup**: Configure through the Home Assistant UI - no YAML required
-- **8 Sensors**: Electricity consumption, gas consumption, API costs, calculated daily costs with standing charges
-- **Tariff Configuration**: Set your own electricity and gas rates including standing charges
-- **Energy Dashboard Compatible**: Works with Home Assistant's Energy Dashboard
-- **Auto Updates**: Data refreshes every 5 minutes
-
-## Sensors Created
-
-| Sensor | Description |
-|--------|-------------|
-| Electricity Consumption | Daily electricity usage (kWh) |
-| Gas Consumption | Daily gas usage (kWh) |
-| Electricity Cost (API) | Cost from Glowmarkt API |
-| Gas Cost (API) | Cost from Glowmarkt API |
-| Electricity Daily Cost | Calculated: (usage × rate) + standing charge |
-| Gas Daily Cost | Calculated: (usage × rate) + standing charge |
-| Total Daily Energy Cost | Combined electricity + gas costs |
-| Daily Standing Charges | Total standing charges |
-
-## Prerequisites
-
-1. A UK SMETS2 smart meter
-2. A [Hildebrand Bright app](https://www.hildebrand.co.uk/bright/) account linked to your smart meter
-3. Home Assistant 2024.1.0 or newer
+- **Full historical electricity and gas consumption import** into Home Assistant Recorder statistics using the original half-hour timestamps.
+- **Full-history discovery without an arbitrary look-back limit**: Glowmarkt `first-time` is used as a cheap locator, then the PT30M readings endpoint determines the first actual billing interval.
+- **DST-safe PT30M history retrieval** in bounded chunks suitable for the Glowmarkt API.
+- **Multi-site Bright account support** with explicit meter-site selection.
+- **Stable entity identity** that prefers the real Glow resource ID, so re-adding a site does not create a new logical meter unnecessarily.
+- **API resilience**: one paced request lane, `Retry-After` support, bounded retries for HTTP 429, transient 5xx responses and transient connection drops. API failures are never interpreted as an empty history boundary.
+- **Lower API pressure**: consumption defaults to 15-minute polling; API-derived cost resources default to 60 minutes; both are configurable with a 5-minute minimum.
+- **Non-blocking history backfill** so Home Assistant setup is not held open while historical data is retrieved.
+- **Home Assistant validation and regression CI** with pytest, Ruff, Hassfest and HACS validation.
 
 ## Installation
 
-### HACS (Recommended)
+### HACS custom repository
 
-1. Open HACS in Home Assistant
-2. Click the three dots menu → **Custom repositories**
-3. Add `https://github.com/McDon22/hildebrand-glow-ha` as an **Integration**
-4. Search for "Hildebrand Glow" and click **Download**
-5. Restart Home Assistant
+1. Open **HACS** in Home Assistant.
+2. Open the three-dot menu and choose **Custom repositories**.
+3. Add `https://github.com/NJWILKS/hildebrand-glow-ha` as an **Integration**.
+4. Search for **Hildebrand Glow (Bright App)** and download it.
+5. Restart Home Assistant.
+6. Go to **Settings → Devices & Services → Add Integration** and search for **Hildebrand Glow**.
 
-### Manual Installation
-
-1. Download the latest release from [GitHub](https://github.com/McDon22/hildebrand-glow-ha/releases)
-2. Extract and copy the `custom_components/hildebrand_glow` folder to your Home Assistant `config/custom_components/` directory
-3. Restart Home Assistant
+For a clean acceptance test, install this fork only; do not keep a second copy of another integration under the same `hildebrand_glow` domain.
 
 ## Configuration
 
-1. Go to **Settings → Devices & Services**
-2. Click **+ Add Integration**
-3. Search for **"Hildebrand Glow"**
-4. Enter your Bright app credentials (email and password)
-5. Configure your tariff rates:
-   - Electricity rate (£/kWh)
-   - Electricity standing charge (£/day)
-   - Gas rate (£/kWh)
-   - Gas standing charge (£/day)
+The setup flow asks for:
 
-### Updating Tariff Rates
+- Bright email address and password
+- Bright meter site / location
+- electricity unit rate and standing charge
+- gas unit rate and standing charge
 
-To update your tariff rates without reconfiguring:
-1. Go to **Settings → Devices & Services**
-2. Find the Hildebrand Glow integration
-3. Click **Configure**
-4. Update your rates
+After setup, **Configure** also exposes:
 
-## Energy Dashboard Setup
+- consumption refresh interval, default **15 minutes**
+- API-cost refresh interval, default **60 minutes**
 
-To use with the Energy Dashboard:
+Intervals below five minutes are blocked to reduce the risk of Glowmarkt HTTP 429 responses.
 
-1. Go to **Settings → Dashboards → Energy**
-2. Add **Electricity grid consumption**: `sensor.smart_meter_electricity_consumption`
-3. Add **Gas consumption**: `sensor.smart_meter_gas_consumption`
-4. Set your tariff rates
+## Energy history model
 
-## Data Availability
+The consumption sensors are cumulative `TOTAL_INCREASING` energy sensors for Home Assistant. Historical Bright data is imported directly into Recorder statistics using the original half-hour readings, aggregated into Home Assistant's hourly statistics while preserving the real shape of the day.
 
-**Important**: Smart meter data from the Glowmarkt API typically has a 24-48 hour delay. The sensors show the most recent available data, which may not be real-time.
+On a fresh install the integration:
 
-For near real-time data, consider using a Glow CAD/IHD device with local MQTT.
+1. asks Glowmarkt `first-time` for an approximate start locator;
+2. queries a small PT30M window around that locator and treats the earliest non-null reading as the real start of available billing history;
+3. retrieves all complete history from that resolved boundary to today in DST-safe PT30M chunks;
+4. imports the hourly statistics in the background;
+5. stores cumulative day state so restarts do not add the same completed day twice.
 
-## Troubleshooting
+A genuine `0.0` reading counts as data. Missing/null readings do not. The current incomplete UK-local day is not treated as completed historical data.
 
-### No resources found
-- Ensure your Bright app account is properly linked to your smart meter
-- Check that you can see data in the Bright mobile app
+`first-time` is deliberately **not** treated as authoritative consumption data. Live testing showed that Glowmarkt metadata can continue to point at historical intervals which the readings endpoint no longer returns. The PT30M readings endpoint therefore decides which intervals actually exist for billing/history purposes.
 
-### Invalid credentials
-- Verify your email and password work in the Bright mobile app
-- Passwords are case-sensitive
+If Glowmarkt temporarily fails, disconnects or rate-limits a request, the integration retries with bounded backoff. A failed request is never converted into a false end-of-history marker.
 
-### Sensors showing unavailable
-- Check your internet connection
-- The Glowmarkt API may be temporarily unavailable
-- Check Home Assistant logs for specific error messages
+For implementation detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## License
+## Sensors
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+The integration creates electricity and gas consumption sensors, API cost sensors when those resources exist, calculated daily electricity/gas/combined cost sensors, and standing-charge totals.
 
-## Acknowledgments
+Glow/Bright DCC data is not real-time and can arrive a day or more late. The coordinator therefore looks for the latest completed day containing actual readings rather than assuming yesterday is already complete.
 
-- [Hildebrand Technology](https://www.hildebrand.co.uk/) for the Glowmarkt API
-- The Home Assistant community
+## Real-data regression contract
 
-## Contributing
+The test suite includes a privacy-safe oracle derived from a contributed real Bright electricity export containing **19,346 half-hour readings** across 404 UK-local days. The raw household CSV is not stored in the repository.
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+The protected live test uses repository environment credentials and verifies:
+
+- Glowmarkt `first-time` still locates the known historical neighbourhood;
+- the PT30M readings endpoint resolves an actual first available interval near that locator;
+- `last-time` has not regressed behind the known export;
+- known completed days retain the exact expected half-hour timestamp geometry, including **50** intervals on the autumn DST day and **46** on the spring DST day.
+
+The contributed CSV is a historical snapshot, not an immutable billing ledger. Live testing proved that Glowmarkt can revise or remove old consumption values while preserving the same timestamp geometry and `first-time` metadata. The **current PT30M readings API is therefore authoritative for consumption values**; old CSV totals and value fingerprints are useful evidence, but they are not release gates.
+
+The live job checks boundaries and timestamp geometry without printing raw household readings or credentials to Actions logs. It is **manual-only** and runs separately from normal pull-request CI.
+
+See [docs/TESTING.md](docs/TESTING.md) for the test strategy and live-contract rules.
+
+## Development
+
+Normal pull-request CI never uses Bright credentials. It runs mocked/unit tests, Ruff, Hassfest and HACS validation. The protected live contract is separate and uses the `glow-live` GitHub Environment.
+
+Bug fixes should arrive with a regression test. Historical/cumulative energy changes require particular care around duplicate imports, restart behaviour, missing readings, UK-local day boundaries, DST and API revisions.
+
+Repository/agent maintenance rules are documented in [AGENTS.md](AGENTS.md).
+
+## Acknowledgements
+
+This fork builds on the work of the original `xmcdanx` / `McDon22` Hildebrand Glow integration and its contributors. Operational patterns were also reviewed against `jonandel/ha-hildebrandglow-dcc`, including resource-based identity, separated polling concerns and API-protective polling intervals.
+
+The project remains MIT licensed; see [LICENSE](LICENSE).

@@ -14,10 +14,15 @@ from custom_components.hildebrand_glow.api import (
 
 
 class FakeResponse:
-    def __init__(self, payload: Any, status: int = 200) -> None:
+    def __init__(
+        self,
+        payload: Any,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._payload = payload
         self.status = status
-        self.headers: dict[str, str] = {}
+        self.headers = headers or {}
 
     async def __aenter__(self) -> "FakeResponse":
         return self
@@ -39,7 +44,16 @@ class FakeSession:
 
     def get(self, url: str, **kwargs: Any) -> FakeResponse:
         self.get_calls.append((url, kwargs))
-        return FakeResponse(self._get_payloads.pop(0))
+        item = self._get_payloads.pop(0)
+        return item if isinstance(item, FakeResponse) else FakeResponse(item)
+
+
+@pytest.fixture(autouse=True)
+def disable_test_request_pacing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "custom_components.hildebrand_glow.api.API_MIN_REQUEST_SPACING_SECONDS",
+        0.0,
+    )
 
 
 def _authenticated_client(session: FakeSession) -> GlowmarktApiClient:
@@ -49,7 +63,13 @@ def _authenticated_client(session: FakeSession) -> GlowmarktApiClient:
     return client
 
 
-def _uk_epoch(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
+def _uk_epoch(
+    year: int,
+    month: int,
+    day: int,
+    hour: int = 0,
+    minute: int = 0,
+) -> int:
     value = datetime(year, month, day, hour, minute, tzinfo=UK_TZ)
     return int(value.astimezone(timezone.utc).timestamp())
 
@@ -79,18 +99,37 @@ async def test_daily_reading_returns_complete_day_with_intervals(freezer) -> Non
     assert result.day == "2026-09-05"
     assert result.value == 0.606
     assert len(result.intervals) == 3
-    assert session.get_calls[0][1]["params"]["period"] == "PT30M"
-    assert session.get_calls[0][1]["params"]["function"] == "sum"
+    params = session.get_calls[0][1]["params"]
+    assert params["period"] == "PT30M"
+    assert params["function"] == "sum"
+    assert params["nulls"] == 1
 
 
 @pytest.mark.asyncio
-async def test_daily_reading_skips_zero_placeholder_day(freezer) -> None:
+async def test_daily_reading_preserves_genuine_zero_day(freezer) -> None:
     freezer.move_to("2026-09-06 12:00:00")
-    start = int(datetime(2026, 9, 4, 0, 0, tzinfo=timezone.utc).timestamp())
+    start = int(datetime(2026, 9, 5, 0, 0, tzinfo=timezone.utc).timestamp())
+    session = FakeSession(
+        [{"status": "OK", "data": [[start, 0.0], [start + 1800, 0.0]]}]
+    )
+    client = _authenticated_client(session)
+
+    result = await client.get_daily_reading("electricity-resource")
+
+    assert result is not None
+    assert result.day == "2026-09-05"
+    assert result.value == 0.0
+    assert len(session.get_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_daily_reading_falls_back_when_latest_day_is_missing(freezer) -> None:
+    freezer.move_to("2026-09-06 12:00:00")
+    prior = int(datetime(2026, 9, 4, 0, 0, tzinfo=timezone.utc).timestamp())
     session = FakeSession(
         [
-            {"status": "OK", "data": [[start + 86400, 0.0], [start + 88200, 0.0]]},
-            {"status": "OK", "data": [[start, 0.4], [start + 1800, 0.6]]},
+            {"status": "OK", "data": [[prior + 86400, None]]},
+            {"status": "OK", "data": [[prior, 0.4], [prior + 1800, 0.6]]},
         ]
     )
     client = _authenticated_client(session)
@@ -109,8 +148,8 @@ async def test_daily_reading_returns_none_after_three_empty_days(freezer) -> Non
     session = FakeSession(
         [
             {"status": "OK", "data": []},
-            {"status": "OK", "data": [[1_700_000_000, 0.0]]},
-            {"status": "OK", "data": [[1_699_913_600, None]]},
+            {"status": "OK", "data": [[1_700_000_000, None]]},
+            {"status": "OK", "data": []},
         ]
     )
     client = _authenticated_client(session)
@@ -120,36 +159,113 @@ async def test_daily_reading_returns_none_after_three_empty_days(freezer) -> Non
 
 
 @pytest.mark.asyncio
-async def test_history_discovery_scans_beyond_old_two_year_limit(freezer) -> None:
-    freezer.move_to("2026-09-06 12:00:00")
+async def test_first_reading_time_uses_authoritative_endpoint() -> None:
+    session = FakeSession(
+        [{"status": "OK", "data": {"firstTs": 1_753_830_000}}]
+    )
+    client = _authenticated_client(session)
 
-    yearly_payloads: list[dict[str, Any]] = []
-    for year in range(2026, 1969, -1):
-        rows = []
-        if year == 2018:
-            rows = [[int(datetime(2018, 1, 1, tzinfo=timezone.utc).timestamp()), 1234.5]]
-        yearly_payloads.append({"status": "OK", "data": rows})
+    first = await client.get_first_reading_time("electricity-resource")
 
-    month_payload = {
-        "status": "OK",
-        "data": [[int(datetime(2018, 6, 1, tzinfo=timezone.utc).timestamp()), 123.4]],
-    }
-    day_payload = {
-        "status": "OK",
-        "data": [[int(datetime(2018, 6, 15, tzinfo=timezone.utc).timestamp()), 4.2]],
-    }
-    session = FakeSession(yearly_payloads + [month_payload, day_payload])
+    assert first == datetime(2025, 7, 29, 23, 0, tzinfo=timezone.utc)
+    assert len(session.get_calls) == 1
+    assert session.get_calls[0][0].endswith(
+        "/resource/electricity-resource/first-time"
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_reading_time_uses_authoritative_endpoint() -> None:
+    session = FakeSession(
+        [{"status": "OK", "data": {"lastTs": 1_788_651_000}}]
+    )
+    client = _authenticated_client(session)
+
+    last = await client.get_last_reading_time("electricity-resource")
+
+    assert last == datetime(2026, 9, 5, 23, 30, tzinfo=timezone.utc)
+    assert len(session.get_calls) == 1
+    assert session.get_calls[0][0].endswith(
+        "/resource/electricity-resource/last-time"
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_available_reading_uses_first_time_as_locator() -> None:
+    locator = _uk_epoch(2025, 7, 30)
+    first_actual = _uk_epoch(2025, 7, 30, 1, 0)
+    session = FakeSession(
+        [
+            {"status": "OK", "data": {"firstTs": locator}},
+            {
+                "status": "OK",
+                "data": [
+                    [locator, None],
+                    [locator + 1800, None],
+                    [first_actual, 0.0],
+                    [first_actual + 1800, 0.125],
+                ],
+            },
+        ]
+    )
+    client = _authenticated_client(session)
+
+    first = await client.get_first_available_reading_time("electricity-resource")
+
+    assert first == datetime.fromtimestamp(first_actual, tz=timezone.utc)
+    assert len(session.get_calls) == 2
+    assert session.get_calls[0][0].endswith("/first-time")
+    params = session.get_calls[1][1]["params"]
+    assert params["period"] == "PT30M"
+    assert params["nulls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_first_available_reading_returns_none_when_locator_window_has_no_data() -> None:
+    locator = _uk_epoch(2025, 7, 30)
+    session = FakeSession(
+        [
+            {"status": "OK", "data": {"firstTs": locator}},
+            {"status": "OK", "data": [[locator, None], [locator + 1800, None]]},
+        ]
+    )
+    client = _authenticated_client(session)
+
+    assert (
+        await client.get_first_available_reading_time("electricity-resource")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_history_discovery_combines_first_time_with_actual_readings() -> None:
+    locator = int(
+        datetime(2018, 6, 15, 12, 30, tzinfo=timezone.utc).timestamp()
+    )
+    actual = int(
+        datetime(2018, 6, 16, 0, 30, tzinfo=timezone.utc).timestamp()
+    )
+    session = FakeSession(
+        [
+            {"status": "OK", "data": {"firstTs": locator}},
+            {
+                "status": "OK",
+                "data": [
+                    [locator, None],
+                    [actual, 0.25],
+                ],
+            },
+        ]
+    )
     client = _authenticated_client(session)
 
     start = await client._find_data_start("electricity-resource")
 
     assert start is not None
-    assert start.date().isoformat() == "2018-06-14"
-    yearly_calls = [
-        call for call in session.get_calls if call[1]["params"]["period"] == "P1Y"
-    ]
-    assert len(yearly_calls) == 57
-    assert len(yearly_calls) > 24
+    assert start.date().isoformat() == "2018-06-16"
+    assert len(session.get_calls) == 2
+    assert session.get_calls[0][0].endswith("/first-time")
+    assert session.get_calls[1][1]["params"]["period"] == "PT30M"
 
 
 @pytest.mark.asyncio
@@ -191,7 +307,10 @@ async def test_full_history_uses_safe_multi_day_pt30m_chunks(freezer) -> None:
     assert readings[0].value == 0.3
     assert readings[2].value == 0.0
     assert len(session.get_calls) == 2
-    assert all(call[1]["params"]["period"] == "PT30M" for call in session.get_calls)
+    assert all(
+        call[1]["params"]["period"] == "PT30M"
+        for call in session.get_calls
+    )
 
     first_from = datetime.fromisoformat(session.get_calls[0][1]["params"]["from"])
     first_to = datetime.fromisoformat(session.get_calls[0][1]["params"]["to"])
@@ -199,13 +318,37 @@ async def test_full_history_uses_safe_multi_day_pt30m_chunks(freezer) -> None:
 
 
 @pytest.mark.asyncio
-async def test_history_api_error_is_not_treated_as_end_of_history(freezer) -> None:
-    freezer.move_to("2026-09-06 12:00:00")
-    session = FakeSession([{"status": "ERROR", "data": []}])
+async def test_first_time_api_error_is_not_treated_as_end_of_history() -> None:
+    session = FakeSession([{"status": "ERROR", "data": {}}])
     client = _authenticated_client(session)
 
     with pytest.raises(GlowmarktApiError):
         await client._find_data_start("electricity-resource")
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_retries_without_returning_fake_empty_data() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                {"status": "ERROR"},
+                status=429,
+                headers={"Retry-After": "0"},
+            ),
+            {"status": "OK", "data": [[1_700_000_000, 0.5]]},
+        ]
+    )
+    client = _authenticated_client(session)
+
+    rows = await client._request_readings(
+        "electricity-resource",
+        datetime(2026, 9, 1, tzinfo=timezone.utc),
+        datetime(2026, 9, 2, tzinfo=timezone.utc),
+        "PT30M",
+    )
+
+    assert rows == [[1_700_000_000, 0.5]]
+    assert len(session.get_calls) == 2
 
 
 @pytest.mark.asyncio
@@ -229,7 +372,9 @@ async def test_discover_resources_for_single_virtual_entity() -> None:
 
     resources = await client.discover_resources()
 
-    assert resources["electricity.consumption"]["resource_id"] == "electricity-resource"
+    assert resources["electricity.consumption"]["resource_id"] == (
+        "electricity-resource"
+    )
     assert resources["electricity.consumption"]["base_unit"] == "kWh"
 
 
@@ -255,4 +400,6 @@ async def test_discover_resources_can_target_selected_virtual_entity() -> None:
 
     assert len(session.get_calls) == 1
     assert "/virtualentity/site-2/resources" in session.get_calls[0][0]
-    assert resources["electricity.consumption"]["resource_id"] == "site-2-electricity"
+    assert resources["electricity.consumption"]["resource_id"] == (
+        "site-2-electricity"
+    )
