@@ -8,6 +8,9 @@ A maintained rescue fork of the Home Assistant integration for UK SMETS2 smart m
 ## What this fork adds
 
 - **Full historical electricity and gas consumption import** into Home Assistant Recorder statistics using the original half-hour timestamps.
+- **Historical cost-component import**: Glow PT30M cost is treated as usage-only and completed P1D cost as usage plus standing charge, allowing the standing charge to be observed rather than guessed.
+- **Native Home Assistant stacked cost graphs** using separate Usage Cost and Standing Charge monetary sensors with backfilled Recorder statistics.
+- **Effective-dated tariff history** from Glow `tariff-list`, persisted locally and refreshed daily so rate/cap changes are not flattened into today's tariff.
 - **Full-history discovery without an arbitrary look-back limit**: Glowmarkt `first-time` is used as a cheap locator, then the PT30M readings endpoint determines the first actual billing interval.
 - **DST-safe PT30M history retrieval** in bounded chunks suitable for the Glowmarkt API.
 - **Multi-site Bright account support** with explicit meter-site selection.
@@ -39,6 +42,8 @@ The setup flow asks for:
 - electricity unit rate and standing charge
 - gas unit rate and standing charge
 
+The configured tariff values are **fallback values**. When Glow cost resources are available, the API-derived cost is authoritative and Glow's effective-dated `tariff-list` is stored separately as the historical tariff ledger.
+
 After setup, **Configure** also exposes:
 
 - consumption refresh interval, default **15 minutes**
@@ -66,9 +71,59 @@ If Glowmarkt temporarily fails, disconnects or rate-limits a request, the integr
 
 For implementation detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Cost and standing-charge model
+
+Bright/Glow cost resources have different aggregation semantics:
+
+- **PT30M and hourly cost** represent usage cost only; standing charge is not included.
+- **P1D, weekly and monthly cost** include standing charge.
+
+The integration therefore does not assume that a configured standing charge has already been applied. For a completed UK-local day it calculates:
+
+`observed standing charge = Glow P1D cost - sum(Glow PT30M cost)`
+
+The Glow P1D total remains authoritative. The residual is used only to separate the bill into usage and standing-charge components.
+
+For the current partial day, the integration uses PT30M cost only and reports a standing-charge component of **£0** until Glow publishes a completed P1D bucket. If one side of the reconciliation is missing or contradictory, the standing-charge split is reported as unavailable/unknown instead of being invented.
+
+Historical cost backfill fetches PT30M cost in DST-safe bounded chunks and P1D cost in bounded daily chunks, joins them by UK-local date and imports separate historical states for:
+
+- **Electricity Usage Cost**
+- **Electricity Standing Charge**
+- **Gas Usage Cost**
+- **Gas Standing Charge**
+
+These are monetary `TOTAL` sensors with long-term Recorder statistics.
+
+### Native stacked cost graph
+
+Home Assistant's built-in Statistics Graph card supports stacked bars, so no custom dashboard card is required. After the entities have been created, a dashboard card can use:
+
+```yaml
+type: statistics-graph
+title: Electricity Cost
+chart_type: bar-stack
+period: day
+stat_types:
+  - state
+entities:
+  - sensor.smart_meter_electricity_usage_cost
+  - sensor.smart_meter_electricity_standing_charge
+```
+
+If Home Assistant chose different entity IDs, select the two corresponding entities in the visual card editor or adjust the YAML.
+
+The same card can use `week`, `month` or `year` periods, and can be tied to an Energy Date Selection card using `energy_date_selection: true`.
+
+## Tariff history
+
+Glow's `tariff-list` is treated as an effective-dated ledger rather than a set of constants. The integration stores the returned tariff history per commodity and refreshes it daily. That preserves historical rate/standing-charge changes such as price-cap changes without recalculating old bills using today's tariff.
+
+The **cost API remains authoritative for actual historical charges**. The tariff ledger explains which tariff was effective; it does not overwrite API-derived historical costs.
+
 ## Sensors
 
-The integration creates electricity and gas consumption sensors, API cost sensors when those resources exist, calculated daily electricity/gas/combined cost sensors, and standing-charge totals.
+The integration creates electricity and gas consumption sensors, API cost sensors when those resources exist, daily cost sensors, separate usage/standing-charge component sensors and combined standing-charge totals.
 
 Glow/Bright DCC data is not real-time and can arrive a day or more late. The coordinator therefore looks for the latest completed day containing actual readings rather than assuming yesterday is already complete.
 
@@ -81,11 +136,13 @@ The protected live test uses repository environment credentials and verifies:
 - Glowmarkt `first-time` still locates the known historical neighbourhood;
 - the PT30M readings endpoint resolves an actual first available interval near that locator;
 - `last-time` has not regressed behind the known export;
-- known completed days retain the exact expected half-hour timestamp geometry, including **50** intervals on the autumn DST day and **46** on the spring DST day.
+- known completed days retain the exact expected half-hour timestamp geometry, including **50** intervals on the autumn DST day and **46** on the spring DST day;
+- a known completed electricity-cost day has a positive P1D-minus-PT30M standing-charge residual;
+- `tariff-list` returns effective-dated tariff history for the known electricity cost resource.
 
 The contributed CSV is a historical snapshot, not an immutable billing ledger. Live testing proved that Glowmarkt can revise or remove old consumption values while preserving the same timestamp geometry and `first-time` metadata. The **current PT30M readings API is therefore authoritative for consumption values**; old CSV totals and value fingerprints are useful evidence, but they are not release gates.
 
-The live job checks boundaries and timestamp geometry without printing raw household readings or credentials to Actions logs. It is **manual-only** and runs separately from normal pull-request CI.
+The live job checks boundaries, timestamp geometry and cost semantics without printing raw household readings, tariff values or credentials to Actions logs. It is **manual-only** and runs separately from normal pull-request CI.
 
 See [docs/TESTING.md](docs/TESTING.md) for the test strategy and live-contract rules.
 
@@ -93,7 +150,7 @@ See [docs/TESTING.md](docs/TESTING.md) for the test strategy and live-contract r
 
 Normal pull-request CI never uses Bright credentials. It runs mocked/unit tests, Ruff, Hassfest and HACS validation. The protected live contract is separate and uses the `glow-live` GitHub Environment.
 
-Bug fixes should arrive with a regression test. Historical/cumulative energy changes require particular care around duplicate imports, restart behaviour, missing readings, UK-local day boundaries, DST and API revisions.
+Bug fixes should arrive with a regression test. Historical/cumulative energy and cost changes require particular care around duplicate imports, restart behaviour, missing readings, UK-local day boundaries, DST and API revisions.
 
 Repository/agent maintenance rules are documented in [AGENTS.md](AGENTS.md).
 
