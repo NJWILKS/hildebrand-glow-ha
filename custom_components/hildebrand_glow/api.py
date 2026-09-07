@@ -21,6 +21,11 @@ UK_TZ = ZoneInfo("Europe/London")
 # that API limit.
 HISTORY_INTERVAL_DAYS = 9
 
+# first-time is useful as a cheap locator, but the readings endpoint is the
+# authoritative source for billable intervals. Search a small bounded window
+# around that locator to establish the first actual reading.
+FIRST_READING_SEARCH_DAYS = 3
+
 # Keep all requests for one Bright account in a single, paced lane. This prevents
 # normal polling and a history backfill from producing a burst of concurrent API
 # calls. 429 and transient server responses additionally honour Retry-After when
@@ -250,7 +255,7 @@ class GlowmarktApiClient:
         return self._resources
 
     async def get_first_reading_time(self, resource_id: str) -> datetime | None:
-        """Return the UTC time of the first available reading for a resource."""
+        """Return Glowmarkt's approximate UTC start time for a resource."""
         await self._ensure_authenticated()
         data = await self._get_json(
             f"{GLOWMARKT_API_BASE}/resource/{resource_id}/first-time",
@@ -306,6 +311,47 @@ class GlowmarktApiClient:
         rows = data.get("data", [])
         return rows if isinstance(rows, list) else []
 
+    async def get_first_available_reading_time(
+        self,
+        resource_id: str,
+    ) -> datetime | None:
+        """Resolve first-time metadata to the first real PT30M billing interval."""
+        locator = await self.get_first_reading_time(resource_id)
+        if locator is None:
+            return None
+
+        search_start_uk = locator.astimezone(UK_TZ).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        search_end_uk = search_start_uk + timedelta(days=FIRST_READING_SEARCH_DAYS)
+        rows = await self._request_readings(
+            resource_id,
+            search_start_uk,
+            search_end_uk,
+            "PT30M",
+        )
+
+        available: list[datetime] = []
+        for row in rows:
+            if len(row) <= 1 or row[1] is None:
+                continue
+            timestamp = datetime.fromtimestamp(float(row[0]), tz=timezone.utc)
+            timestamp_uk = timestamp.astimezone(UK_TZ)
+            if search_start_uk <= timestamp_uk < search_end_uk:
+                available.append(timestamp)
+
+        if not available:
+            _LOGGER.warning(
+                "No actual PT30M readings found near Glowmarkt first-time for %s",
+                resource_id,
+            )
+            return None
+
+        return min(available)
+
     async def _fetch_day_reading(
         self,
         resource_id: str,
@@ -332,7 +378,7 @@ class GlowmarktApiClient:
         for row in rows:
             if len(row) <= 1 or row[1] is None:
                 continue
-            timestamp = datetime.fromtimestamp(row[0], tz=timezone.utc)
+            timestamp = datetime.fromtimestamp(float(row[0]), tz=timezone.utc)
             timestamp_uk = timestamp.astimezone(UK_TZ)
             if timestamp_uk < day_start_uk or timestamp_uk >= day_end_uk:
                 continue
@@ -341,6 +387,7 @@ class GlowmarktApiClient:
         if not intervals:
             return None
 
+        intervals.sort(key=lambda item: item[0])
         return DailyReading(
             day=day_start_uk.date().isoformat(),
             value=round(sum(value for _, value in intervals), 3),
@@ -375,11 +422,11 @@ class GlowmarktApiClient:
         return None
 
     async def _find_data_start(self, resource_id: str) -> datetime | None:
-        """Find the first UK-local day using Glowmarkt's authoritative endpoint."""
-        first_time = await self.get_first_reading_time(resource_id)
-        if first_time is None:
+        """Find the first UK-local day containing an actual PT30M reading."""
+        first_available = await self.get_first_available_reading_time(resource_id)
+        if first_available is None:
             return None
-        return first_time.astimezone(UK_TZ).replace(
+        return first_available.astimezone(UK_TZ).replace(
             hour=0,
             minute=0,
             second=0,
@@ -403,7 +450,7 @@ class GlowmarktApiClient:
         for row in rows:
             if len(row) <= 1 or row[1] is None:
                 continue
-            timestamp = datetime.fromtimestamp(row[0], tz=timezone.utc)
+            timestamp = datetime.fromtimestamp(float(row[0]), tz=timezone.utc)
             timestamp_uk = timestamp.astimezone(UK_TZ)
             if timestamp_uk < start_uk or timestamp_uk >= end_uk:
                 continue
