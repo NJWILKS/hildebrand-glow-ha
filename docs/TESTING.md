@@ -49,6 +49,8 @@ A privacy-safe oracle is derived from a contributed real Bright electricity expo
 
 The repository stores summary/fingerprint data only, not the raw household CSV. The oracle includes useful structural facts such as row counts, date boundaries, totals and SHA-256 fingerprints for selected historic slices.
 
+Those totals/fingerprints describe the export **at the time it was taken**. They are useful diagnostic evidence, but they are not assumed to be an immutable billing ledger: Glowmarkt can revise historic values later.
+
 The raw household data must not be committed to this public repository.
 
 ## Protected live contract
@@ -68,12 +70,14 @@ The live contract verifies:
 
 1. authentication and resource discovery against the real account;
 2. `first-time` still locates the known start neighbourhood;
-3. PT30M readings resolve the real first available interval at or after that locator;
+3. PT30M readings resolve the real first available interval near that locator;
 4. `last-time` has not regressed behind the known export;
-5. selected stable historic slices still match expected PT30M interval counts, totals and fingerprints;
-6. both UK DST transition days retain the correct timestamp geometry.
+5. selected known historic days retain the exact expected PT30M timestamp geometry;
+6. both UK DST transition days retain the correct geometry: 46 spring intervals and 50 autumn intervals.
 
-The earliest exported day is not treated as immutable because live testing demonstrated that very old Glowmarkt rows can disappear while the `first-time` metadata remains unchanged.
+The **current PT30M readings endpoint is authoritative for consumption values**. Exact old CSV totals or value hashes do not fail a release if the current API has revised them. The live contract is deliberately strict about boundaries, interval presence/order and DST geometry instead.
+
+The earliest exported day is also not treated as immutable because live testing demonstrated that very old Glowmarkt rows can disappear while the `first-time` metadata remains unchanged.
 
 ## Privacy rules for live logs
 
