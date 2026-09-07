@@ -2,6 +2,9 @@ name: Live Glowmarkt contract
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feature/api-standing-charge-detection
 
 permissions:
   contents: read
