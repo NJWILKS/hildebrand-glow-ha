@@ -30,10 +30,15 @@ from .const import (
 from .coordinator import GlowmarktDataUpdateCoordinator
 from .costing import CostBreakdown, get_cost_history
 from .identity import sensor_unique_id
+from .tariff import (
+    derive_tariff_periods,
+    normalise_cost_history,
+    tariff_period_as_dict,
+)
 
 _LOGGER = logging.getLogger(__name__)
 COST_HISTORY_STORAGE_VERSION = 1
-COST_BACKFILL_SCHEMA_VERSION = 3
+COST_BACKFILL_SCHEMA_VERSION = 4
 TARIFF_HISTORY_STORAGE_VERSION = 1
 INITIAL_DELAY_SECONDS = 30
 ENTITY_WAIT_RETRIES = 6
@@ -151,8 +156,6 @@ def build_total_cost_statistics(
             hourly_pence[ordered_hours[0]] += residual_pence
 
         day_states = [_gbp_from_pence(hourly_pence[hour]) for hour in ordered_hours]
-        # Make the daily states reconcile exactly to the authoritative P1D total
-        # even if binary floating-point conversion introduced a tiny remainder.
         correction = _round_stat(total_gbp - sum(day_states))
         if correction:
             day_states[-1] = _round_stat(day_states[-1] + correction)
@@ -240,10 +243,35 @@ def _trim_trailing_pending(history: list[CostBreakdown]) -> list[CostBreakdown]:
     return settled
 
 
+async def _load_tariff_ledger(hass: HomeAssistant, site_id: str) -> dict[str, Any]:
+    store = Store(
+        hass,
+        TARIFF_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_tariff_history",
+    )
+    return await store.async_load() or {}
+
+
+async def _save_tariff_analysis(
+    hass: HomeAssistant,
+    site_id: str,
+    analysis: dict[str, list[dict[str, Any]]],
+) -> None:
+    store = Store(
+        hass,
+        TARIFF_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_tariff_history",
+    )
+    state = await store.async_load() or {}
+    state["analysis"] = analysis
+    await store.async_save(state)
+
+
 async def _sync_cost_statistics(
     hass: HomeAssistant,
     coordinator: GlowmarktDataUpdateCoordinator,
     site_id: str,
+    tariff_ledger: dict[str, Any] | None = None,
 ) -> None:
     """Initial-backfill and then incrementally extend cost statistics."""
     store = Store(
@@ -255,6 +283,11 @@ async def _sync_cost_statistics(
     full_backfill = state.get("_backfilled_version") != COST_BACKFILL_SCHEMA_VERSION
     commodity_state = state.setdefault("commodities", {})
     imported: dict[str, int] = {}
+    tariff_analysis: dict[str, list[dict[str, Any]]] = {}
+
+    if tariff_ledger is None:
+        tariff_ledger = await _load_tariff_ledger(hass, site_id)
+    tariff_rows_by_commodity = tariff_ledger.get("commodities", {})
 
     for commodity, (
         cost_classifier,
@@ -292,6 +325,20 @@ async def _sync_cost_statistics(
         if not history:
             continue
 
+        configured_standing = coordinator.tariff_config.get(
+            f"{commodity}_standing_charge"
+        )
+        configured_rate = coordinator.tariff_config.get(f"{commodity}_rate")
+        rows = tariff_rows_by_commodity.get(commodity, [])
+        periods = derive_tariff_periods(
+            rows if isinstance(rows, list) else [],
+            history,
+            configured_standing_gbp=configured_standing,
+            configured_rate_gbp_per_kwh=configured_rate,
+        )
+        tariff_analysis[commodity] = [tariff_period_as_dict(item) for item in periods]
+        history = normalise_cost_history(history, periods)
+
         total_baseline = float(previous.get("total_sum_gbp", 0.0))
         usage_baseline = float(previous.get("usage_sum_gbp", 0.0))
         standing_baseline = float(previous.get("standing_sum_gbp", 0.0))
@@ -306,11 +353,8 @@ async def _sync_cost_statistics(
             standing_baseline=standing_baseline,
         )
 
-        # Keep the human-facing daily entity history for normal HA history cards.
         if total_stats:
             async_import_statistics(hass, _metadata(daily_entity), total_stats)
-            # The Energy dashboard gets a dedicated cumulative statistic, matching
-            # Home Assistant's own delayed-billing integrations such as Opower.
             async_add_external_statistics(
                 hass,
                 _external_cost_metadata(site_id, commodity),
@@ -332,6 +376,8 @@ async def _sync_cost_statistics(
     state["_backfilled"] = True
     state["_backfilled_version"] = COST_BACKFILL_SCHEMA_VERSION
     await store.async_save(state)
+    if tariff_analysis:
+        await _save_tariff_analysis(hass, site_id, tariff_analysis)
     if imported:
         _LOGGER.info(
             "Synced Glowmarkt Energy cost totals/components: %s",
@@ -352,7 +398,7 @@ async def _refresh_tariff_ledger(
     hass: HomeAssistant,
     coordinator: GlowmarktDataUpdateCoordinator,
     site_id: str,
-) -> None:
+) -> dict[str, Any]:
     """Persist Glow's effective-dated tariff history for each available cost resource."""
     ledger: dict[str, list[dict[str, Any]]] = {}
     for commodity, (cost_classifier, _, _, _) in COMPONENT_KEYS.items():
@@ -371,17 +417,20 @@ async def _refresh_tariff_ledger(
                 key=_effective_key,
             )
 
+    result: dict[str, Any] = {
+        "updated_at": datetime.now(UK_TZ).isoformat(),
+        "commodities": ledger,
+    }
     store = Store(
         hass,
         TARIFF_HISTORY_STORAGE_VERSION,
         f"{DOMAIN}_{site_id}_tariff_history",
     )
-    await store.async_save(
-        {
-            "updated_at": datetime.now(UK_TZ).isoformat(),
-            "commodities": ledger,
-        }
-    )
+    existing = await store.async_load() or {}
+    if "analysis" in existing:
+        result["analysis"] = existing["analysis"]
+    await store.async_save(result)
+    return result
 
 
 async def async_cost_history_worker(
@@ -392,37 +441,42 @@ async def async_cost_history_worker(
     """Maintain Energy cost statistics and the effective-dated tariff ledger."""
     await asyncio.sleep(INITIAL_DELAY_SECONDS)
 
+    tariff_ledger: dict[str, Any] | None = None
     try:
-        await _sync_cost_statistics(hass, coordinator, site_id)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        _LOGGER.exception("Glowmarkt cost-history sync failed")
-
-    try:
-        await _refresh_tariff_ledger(hass, coordinator, site_id)
+        tariff_ledger = await _refresh_tariff_ledger(hass, coordinator, site_id)
     except asyncio.CancelledError:
         raise
     except Exception:
         _LOGGER.exception("Glowmarkt tariff-history refresh failed")
 
+    try:
+        await _sync_cost_statistics(hass, coordinator, site_id, tariff_ledger)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOGGER.exception("Glowmarkt cost-history sync failed")
+
     cost_refreshes = 0
     while True:
         await asyncio.sleep(COST_HISTORY_REFRESH_SECONDS)
+        cost_refreshes += 1
+        tariff_ledger = None
+        if cost_refreshes * COST_HISTORY_REFRESH_SECONDS >= TARIFF_REFRESH_SECONDS:
+            cost_refreshes = 0
+            try:
+                tariff_ledger = await _refresh_tariff_ledger(
+                    hass,
+                    coordinator,
+                    site_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("Glowmarkt tariff-history refresh failed")
+
         try:
-            await _sync_cost_statistics(hass, coordinator, site_id)
+            await _sync_cost_statistics(hass, coordinator, site_id, tariff_ledger)
         except asyncio.CancelledError:
             raise
         except Exception:
             _LOGGER.exception("Glowmarkt cost-history sync failed")
-
-        cost_refreshes += 1
-        if cost_refreshes * COST_HISTORY_REFRESH_SECONDS < TARIFF_REFRESH_SECONDS:
-            continue
-        cost_refreshes = 0
-        try:
-            await _refresh_tariff_ledger(hass, coordinator, site_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _LOGGER.exception("Glowmarkt tariff-history refresh failed")
