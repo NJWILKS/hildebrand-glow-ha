@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -93,13 +93,22 @@ async def test_partial_day_uses_pt30m_and_has_zero_standing_charge() -> None:
         now_uk=now,
     )
 
-    assert result == CostBreakdown(
-        day="2026-09-07",
-        total_pence=50.0,
-        usage_pence=50.0,
-        standing_charge_pence=0.0,
-        standing_charge_status="not_applied",
-        complete_day=False,
+    assert result is not None
+    assert result.day == "2026-09-07"
+    assert result.total_pence == 50.0
+    assert result.usage_pence == 50.0
+    assert result.standing_charge_pence == 0.0
+    assert result.standing_charge_status == "not_applied"
+    assert result.complete_day is False
+    assert result.usage_intervals == (
+        (datetime.fromtimestamp(_epoch(today), tz=timezone.utc), 20.0),
+        (
+            datetime.fromtimestamp(
+                _epoch(today.replace(minute=30)),
+                tz=timezone.utc,
+            ),
+            30.0,
+        ),
     )
     assert [call[3] for call in api.calls] == ["PT30M"]
 
