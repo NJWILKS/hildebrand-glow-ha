@@ -2,9 +2,6 @@ name: Live Glowmarkt contract
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - improve/operational-resilience
 
 permissions:
   contents: read
