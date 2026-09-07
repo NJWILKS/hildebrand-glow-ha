@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from homeassistant.components.recorder.models import (
@@ -72,7 +72,7 @@ def build_component_statistics(
 
     for breakdown in history:
         day_start = datetime.fromisoformat(breakdown.day).replace(tzinfo=UK_TZ)
-        start = day_start.astimezone()
+        start = day_start.astimezone(timezone.utc)
 
         if breakdown.usage_pence is not None:
             usage_gbp = round(breakdown.usage_pence / 100.0, 2)
