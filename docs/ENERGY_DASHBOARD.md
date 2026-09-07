@@ -22,7 +22,7 @@ The dedicated statistic is backfilled with:
 
 Recorder keeps sub-penny precision for imported cost data. The UI may still display normal currency rounding, but that display formatting no longer changes the accumulated billing statistic.
 
-On upgrade from 2.1.1, the cost-history schema advances automatically so existing installations receive the dedicated Energy-dashboard cost statistic without deleting entities or Recorder history.
+Version 2.1.5 rebuilds the integration-owned external Energy cost statistic once on upgrade. This removes stale tail rows left by earlier 2.1.x cost backfills that could make Home Assistant display a large negative cost. After that migration, incremental updates resume from Recorder's actual last persisted external `sum`, rather than trusting the integration's sidecar cache as the billing arithmetic authority.
 
 Cost history is then extended incrementally every six hours. A trailing completed day is not finalised until Glow has published its P1D bucket, so the integration does not accidentally treat a usage-only PT30M total as the final bill.
 
