@@ -191,17 +191,70 @@ async def test_last_reading_time_uses_authoritative_endpoint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_history_discovery_uses_first_time_not_year_scanning() -> None:
+async def test_first_available_reading_uses_first_time_as_locator() -> None:
+    locator = _uk_epoch(2025, 7, 30)
+    first_actual = _uk_epoch(2025, 7, 30, 1, 0)
     session = FakeSession(
         [
+            {"status": "OK", "data": {"firstTs": locator}},
             {
                 "status": "OK",
-                "data": {
-                    "firstTs": int(
-                        datetime(2018, 6, 15, 12, 30, tzinfo=timezone.utc).timestamp()
-                    )
-                },
-            }
+                "data": [
+                    [locator, None],
+                    [locator + 1800, None],
+                    [first_actual, 0.0],
+                    [first_actual + 1800, 0.125],
+                ],
+            },
+        ]
+    )
+    client = _authenticated_client(session)
+
+    first = await client.get_first_available_reading_time("electricity-resource")
+
+    assert first == datetime.fromtimestamp(first_actual, tz=timezone.utc)
+    assert len(session.get_calls) == 2
+    assert session.get_calls[0][0].endswith("/first-time")
+    params = session.get_calls[1][1]["params"]
+    assert params["period"] == "PT30M"
+    assert params["nulls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_first_available_reading_returns_none_when_locator_window_has_no_data() -> None:
+    locator = _uk_epoch(2025, 7, 30)
+    session = FakeSession(
+        [
+            {"status": "OK", "data": {"firstTs": locator}},
+            {"status": "OK", "data": [[locator, None], [locator + 1800, None]]},
+        ]
+    )
+    client = _authenticated_client(session)
+
+    assert (
+        await client.get_first_available_reading_time("electricity-resource")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_history_discovery_combines_first_time_with_actual_readings() -> None:
+    locator = int(
+        datetime(2018, 6, 15, 12, 30, tzinfo=timezone.utc).timestamp()
+    )
+    actual = int(
+        datetime(2018, 6, 16, 0, 30, tzinfo=timezone.utc).timestamp()
+    )
+    session = FakeSession(
+        [
+            {"status": "OK", "data": {"firstTs": locator}},
+            {
+                "status": "OK",
+                "data": [
+                    [locator, None],
+                    [actual, 0.25],
+                ],
+            },
         ]
     )
     client = _authenticated_client(session)
@@ -209,10 +262,10 @@ async def test_history_discovery_uses_first_time_not_year_scanning() -> None:
     start = await client._find_data_start("electricity-resource")
 
     assert start is not None
-    assert start.date().isoformat() == "2018-06-15"
-    assert len(session.get_calls) == 1
+    assert start.date().isoformat() == "2018-06-16"
+    assert len(session.get_calls) == 2
     assert session.get_calls[0][0].endswith("/first-time")
-    assert session.get_calls[0][1].get("params") is None
+    assert session.get_calls[1][1]["params"]["period"] == "PT30M"
 
 
 @pytest.mark.asyncio
