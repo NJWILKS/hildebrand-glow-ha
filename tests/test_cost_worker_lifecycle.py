@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 
 import custom_components.hildebrand_glow as integration
 import custom_components.hildebrand_glow.cost_ingestion as cost_ingestion
@@ -12,7 +13,6 @@ from custom_components.hildebrand_glow.const import (
     CONF_VIRTUAL_ENTITY,
     DOMAIN,
 )
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 
 
 class _Entry:
