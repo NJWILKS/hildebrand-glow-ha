@@ -27,7 +27,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import GlowmarktDataUpdateCoordinator
-from .cost_history import async_cost_history_worker
+from .cost_ingestion import async_cost_ingestion_worker
 from .identity import sensor_unique_id, site_identity
 
 SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
@@ -184,8 +184,8 @@ async def async_setup_entry(
     async_add_entities(entities)
     config_entry.async_create_background_task(
         hass,
-        async_cost_history_worker(hass, coordinator, site_id),
-        f"{DOMAIN} cost history worker",
+        async_cost_ingestion_worker(hass, coordinator, site_id),
+        f"{DOMAIN} cost ingestion worker",
     )
 
 
