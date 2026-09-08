@@ -31,20 +31,30 @@ async def test_sensor_platform_owns_exactly_one_cost_worker() -> None:
         ),
     )
     add_entities = MagicMock()
-    worker_token = object()
 
-    with (
-        patch.object(sensor_platform, "GlowmarktSensor", return_value=MagicMock()),
-        patch.object(
-            sensor_platform,
-            "async_cost_ingestion_worker",
-            return_value=worker_token,
-        ) as worker,
-    ):
-        await sensor_platform.async_setup_entry(hass, entry, add_entities)
+    async def worker_target() -> None:
+        return None
 
-    worker.assert_called_once_with(hass, coordinator, "site-123")
-    assert created == [(worker_token, f"{DOMAIN} cost ingestion worker")]
+    scheduled_worker = worker_target()
+    worker = MagicMock(return_value=scheduled_worker)
+
+    try:
+        with (
+            patch.object(sensor_platform, "GlowmarktSensor", return_value=MagicMock()),
+            patch.object(
+                sensor_platform,
+                "async_cost_ingestion_worker",
+                new=worker,
+            ),
+        ):
+            await sensor_platform.async_setup_entry(hass, entry, add_entities)
+
+        worker.assert_called_once_with(hass, coordinator, "site-123")
+        assert created == [
+            (scheduled_worker, f"{DOMAIN} cost ingestion worker")
+        ]
+    finally:
+        scheduled_worker.close()
 
 
 @pytest.mark.asyncio
