@@ -6,7 +6,6 @@ from typing import Any
 
 import pytest
 
-from custom_components.hildebrand_glow import coordinator as coordinator_module
 from custom_components.hildebrand_glow.api import UK_TZ, DailyReading
 from custom_components.hildebrand_glow.const import CLASSIFIER_ELECTRICITY_CONSUMPTION
 from custom_components.hildebrand_glow.coordinator import (
@@ -60,6 +59,17 @@ def _coordinator(hass, api: FakeApi, state: dict[str, Any]):
     return coordinator
 
 
+def _install_stat_writer(coordinator, calls: list[tuple[str, str, float]] | None = None):
+    """Replace Recorder I/O while retaining the production baseline contract."""
+
+    def write(classifier: str, reading: DailyReading, baseline: float) -> float:
+        if calls is not None:
+            calls.append((classifier, reading.day, baseline))
+        return round(baseline + reading.value, 3)
+
+    coordinator._add_consumption_statistics = write
+
+
 def _utc(local: datetime) -> datetime:
     return local.astimezone(timezone.utc)
 
@@ -104,18 +114,13 @@ def test_expected_interval_count_is_dst_safe() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_day_is_live_sensor_only_and_idempotent(hass, monkeypatch) -> None:
+async def test_open_day_replays_full_snapshot_from_closed_baseline_idempotently(hass) -> None:
     today = date(2026, 9, 8)
     api = FakeApi({today.isoformat(): _partial_day(today, [0.2, 0.3])})
     state = _ready_state("2026-09-07", 100.0)
     coordinator = _coordinator(hass, api, state)
-
-    imported: list[Any] = []
-    monkeypatch.setattr(
-        coordinator_module,
-        "async_import_statistics",
-        lambda *_args: imported.append(_args),
-    )
+    calls: list[tuple[str, str, float]] = []
+    _install_stat_writer(coordinator, calls)
 
     now = datetime(2026, 9, 8, 1, 10, tzinfo=UK_TZ)
     first = await coordinator._refresh_consumption(now)
@@ -123,7 +128,7 @@ async def test_open_day_is_live_sensor_only_and_idempotent(hass, monkeypatch) ->
 
     assert first[CLASSIFIER_ELECTRICITY_CONSUMPTION] == 100.5
     assert second[CLASSIFIER_ELECTRICITY_CONSUMPTION] == 100.5
-    assert imported == []
+    assert [baseline for _classifier, _day, baseline in calls] == [100.0, 100.0]
     entry = state[CLASSIFIER_ELECTRICITY_CONSUMPTION]
     assert entry["completed_cumulative"] == 100.0
     assert entry["cumulative"] == 100.5
@@ -137,6 +142,8 @@ async def test_shorter_open_day_response_preserves_last_good_state(hass) -> None
     api = FakeApi({today.isoformat(): _partial_day(today, [0.2, 0.3])})
     state = _ready_state("2026-09-07", 100.0)
     coordinator = _coordinator(hass, api, state)
+    calls: list[tuple[str, str, float]] = []
+    _install_stat_writer(coordinator, calls)
     now = datetime(2026, 9, 8, 1, 10, tzinfo=UK_TZ)
 
     assert (
@@ -152,30 +159,35 @@ async def test_shorter_open_day_response_preserves_last_good_state(hass) -> None
     assert (
         await coordinator._refresh_consumption(now)
     )[CLASSIFIER_ELECTRICITY_CONSUMPTION] == 100.5
+    assert len(calls) == 1
     assert state[CLASSIFIER_ELECTRICITY_CONSUMPTION]["live_intervals"] == 2
 
 
 @pytest.mark.asyncio
-async def test_restart_rebuilds_open_day_without_double_counting(hass) -> None:
+async def test_restart_rebuilds_open_day_from_same_closed_baseline(hass) -> None:
     today = date(2026, 9, 8)
     api = FakeApi({today.isoformat(): _partial_day(today, [0.2, 0.3])})
     state = _ready_state("2026-09-07", 100.0)
     now = datetime(2026, 9, 8, 1, 10, tzinfo=UK_TZ)
 
     first = _coordinator(hass, api, state)
+    _install_stat_writer(first)
     assert (
         await first._refresh_consumption(now)
     )[CLASSIFIER_ELECTRICITY_CONSUMPTION] == 100.5
 
     restarted = _coordinator(hass, api, state)
+    calls: list[tuple[str, str, float]] = []
+    _install_stat_writer(restarted, calls)
     assert (
         await restarted._refresh_consumption(now)
     )[CLASSIFIER_ELECTRICITY_CONSUMPTION] == 100.5
+    assert calls == [(CLASSIFIER_ELECTRICITY_CONSUMPTION, "2026-09-08", 100.0)]
     assert state[CLASSIFIER_ELECTRICITY_CONSUMPTION]["completed_cumulative"] == 100.0
 
 
 @pytest.mark.asyncio
-async def test_completed_gap_is_reconciled_before_open_day(hass, monkeypatch) -> None:
+async def test_completed_gap_is_reconciled_before_open_day(hass) -> None:
     yesterday = date(2026, 9, 7)
     today = date(2026, 9, 8)
     api = FakeApi(
@@ -186,13 +198,8 @@ async def test_completed_gap_is_reconciled_before_open_day(hass, monkeypatch) ->
     )
     state = _ready_state("2026-09-06", 90.0)
     coordinator = _coordinator(hass, api, state)
-
-    imported: list[list[Any]] = []
-
-    def capture(_hass, _metadata, stats) -> None:
-        imported.append(list(stats))
-
-    monkeypatch.setattr(coordinator_module, "async_import_statistics", capture)
+    calls: list[tuple[str, str, float]] = []
+    _install_stat_writer(coordinator, calls)
 
     now = datetime(2026, 9, 8, 1, 10, tzinfo=UK_TZ)
     result = await coordinator._refresh_consumption(now)
@@ -201,15 +208,14 @@ async def test_completed_gap_is_reconciled_before_open_day(hass, monkeypatch) ->
     assert state[CLASSIFIER_ELECTRICITY_CONSUMPTION]["completed_day"] == "2026-09-07"
     assert state[CLASSIFIER_ELECTRICITY_CONSUMPTION]["completed_cumulative"] == 94.8
     assert state[CLASSIFIER_ELECTRICITY_CONSUMPTION]["live_intervals"] == 2
-    assert len(imported) == 1
-    assert imported[0]
-    assert all(
-        item["start"].astimezone(UK_TZ).date() == yesterday for item in imported[0]
-    )
+    assert calls == [
+        (CLASSIFIER_ELECTRICITY_CONSUMPTION, "2026-09-07", 90.0),
+        (CLASSIFIER_ELECTRICITY_CONSUMPTION, "2026-09-08", 94.8),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_incomplete_closed_day_holds_previous_live_total(hass, monkeypatch) -> None:
+async def test_incomplete_closed_day_holds_previous_live_total(hass) -> None:
     yesterday = date(2026, 9, 7)
     today = date(2026, 9, 8)
     api = FakeApi(
@@ -227,13 +233,8 @@ async def test_incomplete_closed_day_holds_previous_live_total(hass, monkeypatch
         }
     )
     coordinator = _coordinator(hass, api, state)
-
-    imported: list[Any] = []
-    monkeypatch.setattr(
-        coordinator_module,
-        "async_import_statistics",
-        lambda *_args: imported.append(_args),
-    )
+    calls: list[tuple[str, str, float]] = []
+    _install_stat_writer(coordinator, calls)
 
     result = await coordinator._refresh_consumption(
         datetime(2026, 9, 8, 1, 10, tzinfo=UK_TZ)
@@ -241,4 +242,4 @@ async def test_incomplete_closed_day_holds_previous_live_total(hass, monkeypatch
 
     assert result[CLASSIFIER_ELECTRICITY_CONSUMPTION] == 94.7
     assert state[CLASSIFIER_ELECTRICITY_CONSUMPTION]["completed_day"] == "2026-09-06"
-    assert imported == []
+    assert calls == []
