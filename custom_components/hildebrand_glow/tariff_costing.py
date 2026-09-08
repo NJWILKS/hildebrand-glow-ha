@@ -48,8 +48,8 @@ def price_cost_history(
     Glow's PT30M cost resource remains the authoritative usage-cost shape while the
     effective tariff standing charge is still applied exactly once.
 
-    Glow P1D cost is retained as a reconciliation oracle. It is not used to distort
-    the two chart components when an explicit tariff can price them directly.
+    Glow's reported cost is retained as a reconciliation oracle. It is not used to
+    distort the two chart components when an explicit tariff can price them directly.
     """
     consumption_days = _consumption_by_day(consumption)
     priced: list[CostBreakdown] = []
@@ -134,6 +134,7 @@ def price_cost_history(
         diagnostics.append(
             {
                 "day": breakdown.day,
+                "complete_day": breakdown.complete_day,
                 "rate_kind": period.rate_kind if period is not None else "unknown",
                 "unit_rate_pence_per_kwh": unit_rate,
                 "unit_rate_source": (
@@ -144,7 +145,7 @@ def price_cost_history(
                 "standing_pence": standing_pence,
                 "standing_source": standing_source,
                 "calculated_total_pence": total_pence,
-                "glow_p1d_total_pence": glow_total,
+                "glow_reported_total_pence": glow_total,
                 "glow_reconciliation_delta_pence": reconciliation_delta,
             }
         )
