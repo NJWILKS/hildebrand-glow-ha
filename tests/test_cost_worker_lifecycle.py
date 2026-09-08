@@ -39,6 +39,7 @@ async def test_setup_starts_cost_worker_only_after_sensor_setup() -> None:
     events: list[str] = []
     entry = _Entry()
     task = MagicMock(name="cost_ingestion_task")
+    task.cancel.return_value = True
 
     coordinator = MagicMock(name="coordinator")
     coordinator.async_config_entry_first_refresh = AsyncMock(
@@ -87,7 +88,12 @@ async def test_setup_starts_cost_worker_only_after_sensor_setup() -> None:
         "cost_worker_started",
     ]
     worker.assert_called_once_with(hass, coordinator, "site-123")
-    assert task.cancel in entry.unload_callbacks
+
+    # Home Assistant accepts a synchronous @callback here only when it returns None.
+    # Registering Task.cancel directly returns bool and is then misread as a coroutine.
+    cancel_callback = entry.unload_callbacks[0]
+    assert cancel_callback() is None
+    task.cancel.assert_called_once_with()
 
 
 @pytest.mark.asyncio
