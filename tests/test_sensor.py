@@ -38,11 +38,12 @@ def test_daily_cost_sensors_expose_reset_boundaries_for_recorder() -> None:
         assert description["diagnostic_commodity"] in ("electricity", "gas")
 
 
-def test_consumption_sensors_read_from_persisted_cumulative_values() -> None:
+def test_consumption_sensors_are_presentation_only_not_second_statistics_owner() -> None:
     for classifier in (
         CLASSIFIER_ELECTRICITY_CONSUMPTION,
         CLASSIFIER_GAS_CONSUMPTION,
     ):
         description = SENSOR_DESCRIPTIONS[classifier]
-        assert description["state_class"] == SensorStateClass.TOTAL_INCREASING
+        assert description["device_class"] == SensorDeviceClass.ENERGY
+        assert "state_class" not in description
         assert description["data_key"] == "cumulative_readings"
