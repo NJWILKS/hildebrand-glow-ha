@@ -109,6 +109,14 @@ def _day_start_utc(day: str) -> datetime:
     )
 
 
+def _hourly_pence(breakdown: CostBreakdown) -> dict[datetime, float]:
+    hourly: dict[datetime, float] = {}
+    for timestamp, value_pence in breakdown.usage_intervals:
+        hour_start = timestamp.replace(minute=0, second=0, microsecond=0)
+        hourly[hour_start] = hourly.get(hour_start, 0.0) + float(value_pence)
+    return hourly
+
+
 def build_total_cost_statistics(
     history: list[CostBreakdown],
     *,
@@ -120,12 +128,7 @@ def build_total_cost_statistics(
 
     for breakdown in history:
         total_gbp = _gbp_from_pence(breakdown.total_pence)
-        hourly_pence: dict[datetime, float] = {}
-        for timestamp, value_pence in breakdown.usage_intervals:
-            hour_start = timestamp.replace(minute=0, second=0, microsecond=0)
-            hourly_pence[hour_start] = (
-                hourly_pence.get(hour_start, 0.0) + float(value_pence)
-            )
+        hourly_pence = _hourly_pence(breakdown)
 
         if not hourly_pence:
             running = _round_stat(running + total_gbp)
@@ -167,30 +170,59 @@ def build_component_statistics(
     usage_baseline: float = 0.0,
     standing_baseline: float = 0.0,
 ) -> tuple[list[StatisticData], list[StatisticData]]:
-    """Build settled daily usage/standing component rows."""
+    """Build hourly rows matching the live daily-reset component sensors.
+
+    Usage ``state`` is cumulative within each UK-local billing day while ``sum``
+    remains cumulative across days. Standing charge appears once in ``sum`` and
+    remains a stable daily ``state`` across the day's hourly rows. This mirrors
+    Recorder's live TOTAL + last_reset semantics and lets completed-day imports
+    overwrite the live provisional day without mixing incompatible shapes.
+    """
     usage_running = _round_stat(usage_baseline)
     standing_running = _round_stat(standing_baseline)
     usage_stats: list[StatisticData] = []
     standing_stats: list[StatisticData] = []
 
     for breakdown in history:
-        start = _day_start_utc(breakdown.day)
+        hourly_pence = _hourly_pence(breakdown)
+        ordered_hours = sorted(hourly_pence)
+        if not ordered_hours:
+            ordered_hours = [_day_start_utc(breakdown.day)]
+
         if breakdown.usage_pence is not None:
-            usage_gbp = _gbp_from_pence(breakdown.usage_pence)
-            usage_running = _round_stat(usage_running + usage_gbp)
-            usage_stats.append(
-                StatisticData(start=start, state=usage_gbp, sum=usage_running)
-            )
+            target_usage = _gbp_from_pence(breakdown.usage_pence)
+            if hourly_pence:
+                increments = [_gbp_from_pence(hourly_pence[hour]) for hour in ordered_hours]
+                correction = _round_stat(target_usage - sum(increments))
+                if correction:
+                    increments[-1] = _round_stat(increments[-1] + correction)
+            else:
+                increments = [target_usage]
+
+            day_state = 0.0
+            for hour_start, increment in zip(ordered_hours, increments, strict=True):
+                day_state = _round_stat(day_state + increment)
+                usage_running = _round_stat(usage_running + increment)
+                usage_stats.append(
+                    StatisticData(
+                        start=hour_start,
+                        state=day_state,
+                        sum=usage_running,
+                    )
+                )
+
         if breakdown.standing_charge_pence is not None:
             standing_gbp = _gbp_from_pence(breakdown.standing_charge_pence)
             standing_running = _round_stat(standing_running + standing_gbp)
-            standing_stats.append(
-                StatisticData(
-                    start=start,
-                    state=standing_gbp,
-                    sum=standing_running,
+            for hour_start in ordered_hours:
+                standing_stats.append(
+                    StatisticData(
+                        start=hour_start,
+                        state=standing_gbp,
+                        sum=standing_running,
+                    )
                 )
-            )
+
     return usage_stats, standing_stats
 
 
@@ -401,9 +433,15 @@ async def _reconcile_locked(
         )
         external_id = energy_cost_statistic_id(site_id, commodity)
 
+        if full_backfill:
+            # These statistics are entirely reconstructable from Bright. Clear the
+            # legacy/live mixed shapes once before the 2.3 completed-day rebuild.
+            await _clear_statistics(
+                hass,
+                [external_id, usage_entity, standing_entity],
+            )
+
         if total_stats:
-            if full_backfill:
-                await _clear_statistics(hass, [external_id])
             async_add_external_statistics(
                 hass,
                 _external_cost_metadata(site_id, commodity),
