@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 import pytest
@@ -14,8 +15,9 @@ from custom_components.hildebrand_glow.const import (
     CLASSIFIER_ELECTRICITY_COST,
     GLOWMARKT_API_BASE,
 )
-from custom_components.hildebrand_glow.costing import get_cost_history, _window_total
+from custom_components.hildebrand_glow.costing import _window_total, get_cost_history
 from custom_components.hildebrand_glow.tariff import derive_tariff_periods
+from custom_components.hildebrand_glow.tariff_costing import price_cost_history
 
 pytestmark = pytest.mark.live
 
@@ -32,6 +34,8 @@ GEOMETRY_TEST_DAYS = (
     "2026-09-05",
 )
 COST_SEMANTICS_DAY = "2026-09-05"
+TARIFF_USAGE_TOLERANCE_PENCE = 5.0
+TARIFF_TOTAL_TOLERANCE_PENCE = 15.0
 
 
 def _oracle() -> dict:
@@ -43,6 +47,68 @@ def _expected_epochs(start: datetime, end: datetime) -> list[int]:
     start_epoch = int(start.astimezone(timezone.utc).timestamp())
     end_epoch = int(end.astimezone(timezone.utc).timestamp())
     return list(range(start_epoch, end_epoch, 1800))
+
+
+def _number(value: Any) -> float | None:
+    """Parse a numeric tariff field without exposing its value in diagnostics."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _sanitised_tariff_shape(row: dict[str, Any]) -> dict[str, Any]:
+    """Describe tariff structure without logging rates, charges, IDs or usage."""
+    rates: set[float] = set()
+    has_time = False
+    has_tier = False
+    has_dynamic = False
+    standing_present = False
+    plan_detail_keys: set[str] = set()
+
+    def walk(value: Any) -> None:
+        nonlocal has_time, has_tier, has_dynamic, standing_present
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"rate", "tourate"}:
+                    parsed = _number(child)
+                    if parsed is not None:
+                        rates.add(round(parsed, 6))
+                elif key in {"standing", "standingCharge"}:
+                    standing_present = standing_present or _number(child) is not None
+                elif key == "time":
+                    has_time = has_time or child not in (None, "", False)
+                elif key == "tier":
+                    has_tier = has_tier or child not in (None, "", False)
+                elif key == "dynamic":
+                    has_dynamic = has_dynamic or child not in (None, "", False)
+                if key == "planDetail" and isinstance(child, list):
+                    for detail in child:
+                        if isinstance(detail, dict):
+                            plan_detail_keys.update(str(item) for item in detail)
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(row.get("plan", row))
+    raw_effective = row.get("effectiveDate") or row.get("from") or row.get("effective")
+    effective_day = str(raw_effective)[:10] if raw_effective else None
+    return {
+        "effective_day": effective_day,
+        "rate_count": len(rates),
+        "has_time": has_time,
+        "has_tier": has_tier,
+        "has_dynamic": has_dynamic,
+        "standing_present": standing_present,
+        "plan_detail_keys": sorted(plan_detail_keys),
+    }
 
 
 async def _known_electricity_resources(
@@ -74,7 +140,7 @@ async def _known_electricity_resources(
 
 @pytest.mark.asyncio
 async def test_live_account_matches_known_electricity_export() -> None:
-    """Validate current billing API geometry and cost semantics."""
+    """Validate current billing API geometry, tariffs and cost semantics."""
     oracle = _oracle()
     username = os.environ["GLOWMARKT_USERNAME"]
     password = os.environ["GLOWMARKT_PASSWORD"]
@@ -107,8 +173,8 @@ async def test_live_account_matches_known_electricity_export() -> None:
         # The contributed CSV is a historical snapshot, not an immutable billing
         # ledger. Glow can revise historic values while retaining the same timestamp
         # geometry. Current PT30M API values are therefore authoritative; the oracle
-        # is used to prove we are querying the same known days and preserving every
-        # expected half-hour, especially across both UK DST transitions.
+        # proves we are querying the same known days and preserving every expected
+        # half-hour, especially across both UK DST transitions.
         for day in GEOMETRY_TEST_DAYS:
             expected = oracle["known_days"][day]
             start = datetime.fromisoformat(day).replace(tzinfo=UK_TZ)
@@ -130,8 +196,7 @@ async def test_live_account_matches_known_electricity_export() -> None:
                 pytest.fail(f"Live contract: timestamp geometry mismatch for case {day}")
 
         # Bright cost aggregation semantics: PT30M is usage-only while P1D contains
-        # the completed-day standing charge. Validate this on a known completed day
-        # without printing household costs to Actions logs.
+        # the completed-day standing charge.
         cost_start = datetime.fromisoformat(COST_SEMANTICS_DAY).replace(tzinfo=UK_TZ)
         cost_end = cost_start + timedelta(days=1)
         pt30m_rows = await client._request_readings(
@@ -162,11 +227,6 @@ async def test_live_account_matches_known_electricity_export() -> None:
         if not isinstance(tariff_rows, list) or not tariff_rows:
             pytest.fail("Live contract: tariff-list returned no effective-dated tariff history")
 
-        # A standing charge is stable within one effective tariff period even
-        # though P1D-minus-summed-PT30M residuals wobble because the aggregations
-        # carry different rounding precision. Validate that production period
-        # resolution finds an explicit tariff standing charge close to the centre
-        # of a recent residual cluster, without logging the household tariff.
         recent_start = datetime.now(UK_TZ) - timedelta(days=35)
         recent_history = await get_cost_history(
             client,
@@ -200,4 +260,70 @@ async def test_live_account_matches_known_electricity_export() -> None:
         ):
             pytest.fail(
                 "Live contract: tariff standing charge did not match residual cluster"
+            )
+
+        # 2.3.4's end-game contract: for a flat tariff, consumption × the exact
+        # effective unit rate plus the exact standing charge must reproduce Bright's
+        # cost resources closely enough that the stacked Usage + Standing chart is
+        # billing-real rather than an inferred visual approximation.
+        contract_reading = await client._fetch_day_reading(
+            resource_id,
+            cost_start,
+            cost_end,
+        )
+        contract_breakdown = next(
+            (
+                item
+                for item in recent_history
+                if item.day == COST_SEMANTICS_DAY
+            ),
+            None,
+        )
+        if contract_reading is None or contract_breakdown is None:
+            pytest.fail("Live contract: tariff pricing day is not available")
+
+        priced, diagnostics = price_cost_history(
+            [contract_breakdown],
+            [contract_reading],
+            periods,
+        )
+        if not priced or not diagnostics:
+            pytest.fail("Live contract: tariff pricing produced no result")
+        diagnostic = diagnostics[0]
+        tariff_shapes = [
+            _sanitised_tariff_shape(row)
+            for row in tariff_rows
+            if isinstance(row, dict)
+        ]
+        print(
+            "Live tariff classification diagnostics: "
+            f"rate_kind={diagnostic['rate_kind']}; "
+            f"unit_rate_resolved={diagnostic['unit_rate_pence_per_kwh'] is not None}; "
+            f"standing_resolved={diagnostic['standing_pence'] is not None}; "
+            f"tariff_shapes={json.dumps(tariff_shapes, sort_keys=True)}"
+        )
+        if diagnostic["rate_kind"] != "flat":
+            pytest.fail(
+                "Live contract: known-account flat-tariff classification mismatch; "
+                f"rate_kind={diagnostic['rate_kind']}; "
+                f"sanitised tariff shapes={json.dumps(tariff_shapes, sort_keys=True)}"
+            )
+        if diagnostic["unit_rate_pence_per_kwh"] is None:
+            pytest.fail("Live contract: flat tariff unit rate was not resolved")
+        if diagnostic["standing_pence"] is None:
+            pytest.fail("Live contract: standing charge was not resolved")
+
+        priced_usage = priced[0].usage_pence
+        if priced_usage is None:
+            pytest.fail("Live contract: tariff-priced usage was unavailable")
+        if abs(float(priced_usage) - float(usage_cost)) > TARIFF_USAGE_TOLERANCE_PENCE:
+            pytest.fail(
+                "Live contract: consumption x tariff unit rate does not match PT30M cost"
+            )
+        if (
+            abs(float(priced[0].total_pence) - float(daily_cost))
+            > TARIFF_TOTAL_TOLERANCE_PENCE
+        ):
+            pytest.fail(
+                "Live contract: tariff-priced usage + standing does not match P1D cost"
             )

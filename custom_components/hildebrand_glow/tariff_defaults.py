@@ -1,11 +1,13 @@
 """Resolve Home Assistant tariff-setting defaults from the stored Glow ledger."""
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
+from .api import UK_TZ
 from .const import (
     CONF_ELECTRICITY_RATE,
     CONF_ELECTRICITY_STANDING_CHARGE,
@@ -22,8 +24,20 @@ _RATE_KEYS = {
 }
 
 
-def latest_tariff_defaults(ledger: dict[str, Any]) -> dict[str, float]:
-    """Return current flat-rate/standing-charge values in pounds from a tariff ledger."""
+def latest_tariff_defaults(
+    ledger: dict[str, Any],
+    *,
+    as_of: date | None = None,
+) -> dict[str, float]:
+    """Return the currently effective Glow tariff values in pounds.
+
+    Glow can publish a future tariff period before it becomes active. Settings must
+    default to the latest period effective *today*, not simply the final row in the
+    tariff list.
+    """
+    if as_of is None:
+        as_of = datetime.now(UK_TZ).date()
+
     result: dict[str, float] = {}
     commodities = ledger.get("commodities", {})
     if not isinstance(commodities, dict):
@@ -34,9 +48,10 @@ def latest_tariff_defaults(ledger: dict[str, Any]) -> dict[str, float]:
         if not isinstance(rows, list):
             continue
         periods = parse_tariff_periods([row for row in rows if isinstance(row, dict)])
-        if not periods:
+        effective = [period for period in periods if period.effective_from <= as_of]
+        if not effective:
             continue
-        latest = periods[-1]
+        latest = effective[-1]
         if latest.unit_rate_pence_per_kwh is not None:
             result[rate_key] = round(latest.unit_rate_pence_per_kwh / 100.0, 6)
         if latest.standing_pence is not None:

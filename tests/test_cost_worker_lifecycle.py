@@ -5,95 +5,56 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 
-import custom_components.hildebrand_glow as integration
 import custom_components.hildebrand_glow.cost_ingestion as cost_ingestion
+import custom_components.hildebrand_glow.sensor as sensor_platform
 from custom_components.hildebrand_glow.const import (
+    CLASSIFIER_ELECTRICITY_COST,
     CONF_VIRTUAL_ENTITY,
     DOMAIN,
 )
 
 
-class _Entry:
-    def __init__(self) -> None:
-        self.entry_id = "entry-1"
-        self.data = {
-            CONF_USERNAME: "user",
-            CONF_PASSWORD: "password",
-            CONF_VIRTUAL_ENTITY: "site-123",
-        }
-        self.options: dict[str, object] = {}
-        self.unload_callbacks: list[object] = []
-
-    def async_on_unload(self, callback) -> None:
-        self.unload_callbacks.append(callback)
-
-    def add_update_listener(self, _listener):
-        return MagicMock(name="remove_update_listener")
-
-
 @pytest.mark.asyncio
-async def test_setup_starts_cost_worker_only_after_sensor_setup() -> None:
-    """Regression: cost history must be primed after entities are registered."""
-    events: list[str] = []
-    entry = _Entry()
-    task = MagicMock(name="cost_ingestion_task")
-    task.cancel.return_value = True
-
-    coordinator = MagicMock(name="coordinator")
-    coordinator.async_config_entry_first_refresh = AsyncMock(
-        side_effect=lambda: events.append("first_refresh")
+async def test_sensor_platform_owns_exactly_one_cost_worker() -> None:
+    """Regression: setup must not create duplicate cost-ingestion workers."""
+    coordinator = SimpleNamespace(
+        resources={CLASSIFIER_ELECTRICITY_COST: {"resource_id": "cost-resource"}}
     )
-    coordinator.schedule_history_backfill.side_effect = lambda: events.append(
-        "history_backfill_scheduled"
-    )
-
-    async def _forward_entry_setups(_entry, _platforms) -> None:
-        events.append("sensor_setup_complete")
-
-    def _create_background_task(_coro, *, name: str):
-        assert name == f"{DOMAIN} cost ingestion"
-        events.append("cost_worker_started")
-        return task
-
-    hass = SimpleNamespace(
-        data={},
-        config_entries=SimpleNamespace(
-            async_forward_entry_setups=AsyncMock(side_effect=_forward_entry_setups)
+    hass = SimpleNamespace(data={DOMAIN: {"entry-1": coordinator}})
+    created: list[tuple[object, str]] = []
+    entry = SimpleNamespace(
+        entry_id="entry-1",
+        data={CONF_VIRTUAL_ENTITY: "site-123"},
+        async_create_background_task=lambda _hass, target, name: created.append(
+            (target, name)
         ),
-        async_create_background_task=MagicMock(side_effect=_create_background_task),
     )
+    add_entities = MagicMock()
 
-    with (
-        patch.object(integration, "async_get_clientsession", return_value=object()),
-        patch.object(integration, "GlowmarktApiClient", return_value=object()),
-        patch.object(
-            integration,
-            "GlowmarktDataUpdateCoordinator",
-            return_value=coordinator,
-        ),
-        patch.object(
-            integration,
-            "async_cost_ingestion_worker",
-            return_value=object(),
-        ) as worker,
-    ):
-        assert await integration.async_setup_entry(hass, entry) is True
+    async def worker_target() -> None:
+        return None
 
-    assert events == [
-        "first_refresh",
-        "sensor_setup_complete",
-        "history_backfill_scheduled",
-        "cost_worker_started",
-    ]
-    worker.assert_called_once_with(hass, coordinator, "site-123")
+    scheduled_worker = worker_target()
+    worker = MagicMock(return_value=scheduled_worker)
 
-    # Home Assistant accepts a synchronous @callback here only when it returns None.
-    # Registering Task.cancel directly returns bool and is then misread as a coroutine.
-    cancel_callback = entry.unload_callbacks[0]
-    assert cancel_callback() is None
-    task.cancel.assert_called_once_with()
+    try:
+        with (
+            patch.object(sensor_platform, "GlowmarktSensor", return_value=MagicMock()),
+            patch.object(
+                sensor_platform,
+                "async_cost_ingestion_worker",
+                new=worker,
+            ),
+        ):
+            await sensor_platform.async_setup_entry(hass, entry, add_entities)
+
+        worker.assert_called_once_with(hass, coordinator, "site-123")
+        assert created == [
+            (scheduled_worker, f"{DOMAIN} cost ingestion worker")
+        ]
+    finally:
+        scheduled_worker.close()
 
 
 @pytest.mark.asyncio

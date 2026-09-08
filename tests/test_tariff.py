@@ -47,6 +47,28 @@ def test_tariff_list_builds_effective_dated_flat_periods() -> None:
     assert periods[1].unit_rate_pence_per_kwh == 24.50
 
 
+def test_flat_tariff_with_documented_tier_one_marker_stays_flat() -> None:
+    rows = [
+        {
+            "effectiveDate": "2026-08-30 00:00:00",
+            "plan": [
+                {
+                    "planDetail": [
+                        {"standing": 58.20},
+                        {"tier": 1, "rate": 24.50},
+                    ]
+                }
+            ],
+        }
+    ]
+
+    period = parse_tariff_periods(rows)[0]
+
+    assert period.standing_pence == 58.20
+    assert period.unit_rate_pence_per_kwh == 24.50
+    assert period.rate_kind == "flat"
+
+
 def test_tariff_list_keeps_standing_charge_for_tou_tariff() -> None:
     rows = [
         {
@@ -68,6 +90,29 @@ def test_tariff_list_keeps_standing_charge_for_tou_tariff() -> None:
     assert period.standing_pence == 50.0
     assert period.unit_rate_pence_per_kwh is None
     assert period.rate_kind == "tou"
+
+
+def test_multiple_tiered_rates_without_time_windows_are_block_tariff() -> None:
+    rows = [
+        {
+            "effectiveDate": "2026-01-01 00:00:00",
+            "plan": [
+                {
+                    "planDetail": [
+                        {"standing": 50.0},
+                        {"tier": 1, "rate": 20.0},
+                        {"tier": 2, "rate": 30.0},
+                    ]
+                }
+            ],
+        }
+    ]
+
+    period = parse_tariff_periods(rows)[0]
+
+    assert period.standing_pence == 50.0
+    assert period.unit_rate_pence_per_kwh is None
+    assert period.rate_kind == "block"
 
 
 def test_known_current_tariff_calibrates_without_using_noisy_daily_residuals() -> None:

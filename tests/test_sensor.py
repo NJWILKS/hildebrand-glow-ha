@@ -14,7 +14,7 @@ def test_daily_standing_charge_uses_valid_monetary_state_class() -> None:
     assert description["state_class"] == SensorStateClass.TOTAL
 
 
-def test_cost_components_are_stackable_long_term_monetary_sensors() -> None:
+def test_cost_components_are_single_owner_stackable_monetary_sensors() -> None:
     for key in (
         "electricity_usage_cost",
         "electricity_standing_charge",
@@ -23,7 +23,9 @@ def test_cost_components_are_stackable_long_term_monetary_sensors() -> None:
     ):
         description = SENSOR_DESCRIPTIONS[key]
         assert description["device_class"] == SensorDeviceClass.MONETARY
-        assert description["state_class"] == SensorStateClass.TOTAL
+        # The integration imports both historical and current-day component stats.
+        # Recorder must not independently compile a second series from live states.
+        assert "state_class" not in description
         assert description["native_unit_of_measurement"] == "GBP"
         assert description["data_key"] == "costs"
         assert description["daily_reset"] is True
@@ -38,11 +40,13 @@ def test_daily_cost_sensors_expose_reset_boundaries_for_recorder() -> None:
         assert description["diagnostic_commodity"] in ("electricity", "gas")
 
 
-def test_consumption_sensors_read_from_persisted_cumulative_values() -> None:
+def test_consumption_sensors_show_today_only_and_are_not_statistics_owner() -> None:
     for classifier in (
         CLASSIFIER_ELECTRICITY_CONSUMPTION,
         CLASSIFIER_GAS_CONSUMPTION,
     ):
         description = SENSOR_DESCRIPTIONS[classifier]
-        assert description["state_class"] == SensorStateClass.TOTAL_INCREASING
-        assert description["data_key"] == "cumulative_readings"
+        assert description["device_class"] == SensorDeviceClass.ENERGY
+        assert "state_class" not in description
+        assert description["data_key"] == "readings"
+        assert description["name"].endswith("Today")

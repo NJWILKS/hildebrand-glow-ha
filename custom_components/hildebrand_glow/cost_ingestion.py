@@ -1,4 +1,4 @@
-"""Rolling and completed-day cost ingestion for Hildebrand Glow."""
+"""Tariff-first cost ingestion for Hildebrand Glow."""
 from __future__ import annotations
 
 import asyncio
@@ -21,16 +21,19 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
 
-from .api import GlowmarktApiError, UK_TZ
+from .api import HISTORY_INTERVAL_DAYS, DailyReading, GlowmarktApiError, UK_TZ
 from .const import (
+    CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_ELECTRICITY_COST,
+    CLASSIFIER_GAS_CONSUMPTION,
     CLASSIFIER_GAS_COST,
     DOMAIN,
     GLOWMARKT_API_BASE,
 )
 from .costing import CostBreakdown, get_cost_history
 from .identity import sensor_unique_id
-from .tariff import derive_tariff_periods, normalise_cost_history, tariff_period_as_dict
+from .tariff import derive_tariff_periods, tariff_period_as_dict
+from .tariff_costing import price_cost_history
 
 if TYPE_CHECKING:
     from .coordinator import GlowmarktDataUpdateCoordinator
@@ -39,22 +42,25 @@ _LOGGER = logging.getLogger(__name__)
 
 COST_HISTORY_STORAGE_VERSION = 1
 TARIFF_HISTORY_STORAGE_VERSION = 1
-COST_BACKFILL_SCHEMA_VERSION = 6
-COST_INGESTION_SCHEMA_VERSION = 1
+COST_BACKFILL_SCHEMA_VERSION = 7
+COST_INGESTION_SCHEMA_VERSION = 2
 INITIAL_DELAY_SECONDS = 30
 COST_HISTORY_REFRESH_SECONDS = 6 * 60 * 60
 TARIFF_REFRESH_SECONDS = 24 * 60 * 60
 STAT_PRECISION = 6
+RECONCILIATION_WARNING_PENCE = 5.0
 
 COMPONENT_KEYS = {
     "electricity": (
         CLASSIFIER_ELECTRICITY_COST,
+        CLASSIFIER_ELECTRICITY_CONSUMPTION,
         "electricity_daily_cost",
         "electricity_usage_cost",
         "electricity_standing_charge",
     ),
     "gas": (
         CLASSIFIER_GAS_COST,
+        CLASSIFIER_GAS_CONSUMPTION,
         "gas_daily_cost",
         "gas_usage_cost",
         "gas_standing_charge",
@@ -71,6 +77,7 @@ def _gbp_from_pence(value: float) -> float:
 
 
 def _metadata(entity_id: str) -> StatisticMetaData:
+    """Metadata for integration-owned statistics attached to a sensor entity."""
     return StatisticMetaData(
         has_sum=True,
         mean_type=StatisticMeanType.NONE,
@@ -83,7 +90,7 @@ def _metadata(entity_id: str) -> StatisticMetaData:
 
 
 def energy_cost_statistic_id(site_id: str, commodity: str) -> str:
-    """Return the stable external Energy cost statistic ID."""
+    """Return the stable external Energy total-cost statistic ID."""
     safe_site = re.sub(r"[^a-z0-9_]+", "_", site_id.lower()).strip("_")
     safe_commodity = re.sub(r"[^a-z0-9_]+", "_", commodity.lower()).strip("_")
     return f"{DOMAIN}:{safe_site}_{safe_commodity}_energy_cost"
@@ -102,11 +109,7 @@ def _external_cost_metadata(site_id: str, commodity: str) -> StatisticMetaData:
 
 
 def _day_start_utc(day: str) -> datetime:
-    return (
-        datetime.fromisoformat(day)
-        .replace(tzinfo=UK_TZ)
-        .astimezone(timezone.utc)
-    )
+    return datetime.fromisoformat(day).replace(tzinfo=UK_TZ).astimezone(timezone.utc)
 
 
 def _hourly_pence(breakdown: CostBreakdown) -> dict[datetime, float]:
@@ -122,7 +125,7 @@ def build_total_cost_statistics(
     *,
     baseline: float = 0.0,
 ) -> list[StatisticData]:
-    """Build hourly Energy cost rows with a monotonic cumulative sum."""
+    """Build hourly total-cost rows with a monotonic cumulative Energy sum."""
     running = _round_stat(baseline)
     stats: list[StatisticData] = []
 
@@ -144,6 +147,8 @@ def build_total_cost_statistics(
         ordered_hours = sorted(hourly_pence)
         residual_pence = float(breakdown.total_pence) - sum(hourly_pence.values())
         if residual_pence:
+            # The standing charge is a daily cost. Put it into the first published
+            # hour so the total-cost Energy series adds it once and only once.
             hourly_pence[ordered_hours[0]] += residual_pence
 
         day_states = [_gbp_from_pence(hourly_pence[hour]) for hour in ordered_hours]
@@ -170,13 +175,11 @@ def build_component_statistics(
     usage_baseline: float = 0.0,
     standing_baseline: float = 0.0,
 ) -> tuple[list[StatisticData], list[StatisticData]]:
-    """Build hourly rows matching the live daily-reset component sensors.
+    """Build stackable daily usage-cost and standing-charge statistics.
 
-    Usage ``state`` is cumulative within each UK-local billing day while ``sum``
-    remains cumulative across days. Standing charge appears once in ``sum`` and
-    remains a stable daily ``state`` across the day's hourly rows. This mirrors
-    Recorder's live TOTAL + last_reset semantics and lets completed-day imports
-    overwrite the live provisional day without mixing incompatible shapes.
+    ``state`` is the value a daily bar should display. Usage state accumulates
+    through the UK-local day; standing state is the one fixed daily charge. ``sum``
+    remains monotonic across days for Recorder's long-term statistics model.
     """
     usage_running = _round_stat(usage_baseline)
     standing_running = _round_stat(standing_baseline)
@@ -272,7 +275,7 @@ async def _load_tariff_ledger(hass: HomeAssistant, site_id: str) -> dict[str, An
 async def _save_tariff_analysis(
     hass: HomeAssistant,
     site_id: str,
-    analysis: dict[str, list[dict[str, Any]]],
+    analysis: dict[str, Any],
 ) -> None:
     store = Store(
         hass,
@@ -298,8 +301,15 @@ async def _refresh_tariff_ledger(
     coordinator: GlowmarktDataUpdateCoordinator,
     site_id: str,
 ) -> dict[str, Any]:
+    """Fetch and persist the effective-dated Glow tariff ledger first."""
     ledger: dict[str, list[dict[str, Any]]] = {}
-    for commodity, (cost_classifier, _daily, _usage, _standing) in COMPONENT_KEYS.items():
+    for commodity, (
+        cost_classifier,
+        _consumption_classifier,
+        _daily,
+        _usage,
+        _standing,
+    ) in COMPONENT_KEYS.items():
         resource = coordinator.resources.get(cost_classifier)
         if not resource:
             continue
@@ -345,7 +355,7 @@ def _yesterday(now_uk: datetime) -> str:
 
 
 def _settled_prefix(history: list[CostBreakdown]) -> list[CostBreakdown]:
-    """Stop at the first day for which Glow has not published P1D yet."""
+    """Stop at the first completed day for which Glow has not published P1D yet."""
     settled: list[CostBreakdown] = []
     for breakdown in history:
         if breakdown.standing_charge_status == "daily_pending":
@@ -354,18 +364,80 @@ def _settled_prefix(history: list[CostBreakdown]) -> list[CostBreakdown]:
     return settled
 
 
+async def _consumption_history(
+    coordinator: GlowmarktDataUpdateCoordinator,
+    resource_id: str,
+    *,
+    start_uk: datetime | None,
+) -> list[DailyReading]:
+    """Fetch consumption for the same window being costed."""
+    if start_uk is None:
+        return await coordinator.api_client.get_available_daily_readings(resource_id)
+
+    start_uk = start_uk.astimezone(UK_TZ).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    today_start = datetime.now(UK_TZ).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    result: list[DailyReading] = []
+    chunk_start = start_uk
+    while chunk_start < today_start:
+        chunk_end = min(
+            chunk_start + timedelta(days=HISTORY_INTERVAL_DAYS),
+            today_start,
+        )
+        result.extend(
+            await coordinator.api_client._fetch_history_chunk(  # noqa: SLF001
+                resource_id,
+                chunk_start,
+                chunk_end,
+            )
+        )
+        chunk_start = chunk_end
+    return result
+
+
+def _log_pricing_reconciliation(
+    commodity: str,
+    diagnostics: list[dict[str, Any]],
+) -> None:
+    for item in diagnostics:
+        if not item.get("complete_day"):
+            continue
+        delta = item.get("glow_reconciliation_delta_pence")
+        if delta is None:
+            continue
+        if abs(float(delta)) > RECONCILIATION_WARNING_PENCE:
+            _LOGGER.warning(
+                "Tariff-priced %s cost differs from Glow P1D by %.3fp on %s "
+                "(usage=%s, standing=%s)",
+                commodity,
+                float(delta),
+                item.get("day"),
+                item.get("usage_source"),
+                item.get("standing_source"),
+            )
+
+
 async def _reconcile_locked(
     hass: HomeAssistant,
     coordinator: GlowmarktDataUpdateCoordinator,
     site_id: str,
     tariff_ledger: dict[str, Any] | None,
 ) -> bool:
-    """Reconcile every available completed day."""
+    """Reconcile every available completed day using tariff-first components."""
     store, state = await _load_store(hass, site_id)
     full_backfill = state.get("_ingestion_version") != COST_INGESTION_SCHEMA_VERSION
     commodity_state = state.setdefault("commodities", {})
     imported: dict[str, int] = {}
-    tariff_analysis: dict[str, list[dict[str, Any]]] = {}
+    tariff_analysis: dict[str, Any] = {}
 
     if tariff_ledger is None:
         tariff_ledger = await _load_tariff_ledger(hass, site_id)
@@ -373,13 +445,15 @@ async def _reconcile_locked(
 
     for commodity, (
         cost_classifier,
+        consumption_classifier,
         _daily_key,
         usage_key,
         standing_key,
     ) in COMPONENT_KEYS.items():
-        resource = coordinator.resources.get(cost_classifier)
-        if not resource:
+        cost_resource = coordinator.resources.get(cost_classifier)
+        if not cost_resource:
             continue
+        consumption_resource = coordinator.resources.get(consumption_classifier)
 
         usage_entity = await _entity_id(hass, site_id, usage_key)
         standing_entity = await _entity_id(hass, site_id, standing_key)
@@ -402,13 +476,13 @@ async def _reconcile_locked(
         standing_baseline = float(previous.get("standing_sum_gbp", 0.0))
         start_uk = _next_day(completed_day) if completed_day and not full_backfill else None
 
-        history = await get_cost_history(
+        raw_history = await get_cost_history(
             coordinator.api_client,
-            resource["resource_id"],
+            cost_resource["resource_id"],
             start_uk=start_uk,
         )
-        history = _settled_prefix(history)
-        if not history:
+        raw_history = _settled_prefix(raw_history)
+        if not raw_history:
             continue
 
         configured_standing = coordinator.tariff_config.get(
@@ -418,12 +492,25 @@ async def _reconcile_locked(
         rows = tariff_rows_by_commodity.get(commodity, [])
         periods = derive_tariff_periods(
             rows if isinstance(rows, list) else [],
-            history,
+            raw_history,
             configured_standing_gbp=configured_standing,
             configured_rate_gbp_per_kwh=configured_rate,
         )
-        tariff_analysis[commodity] = [tariff_period_as_dict(item) for item in periods]
-        history = normalise_cost_history(history, periods)
+
+        consumption: list[DailyReading] = []
+        if consumption_resource is not None:
+            consumption = await _consumption_history(
+                coordinator,
+                consumption_resource["resource_id"],
+                start_uk=start_uk,
+            )
+
+        history, pricing = price_cost_history(raw_history, consumption, periods)
+        _log_pricing_reconciliation(commodity, pricing)
+        tariff_analysis[commodity] = {
+            "periods": [tariff_period_as_dict(item) for item in periods],
+            "pricing": pricing,
+        }
 
         total_stats = build_total_cost_statistics(history, baseline=total_baseline)
         usage_stats, standing_stats = build_component_statistics(
@@ -434,8 +521,6 @@ async def _reconcile_locked(
         external_id = energy_cost_statistic_id(site_id, commodity)
 
         if full_backfill:
-            # These statistics are entirely reconstructable from Bright. Clear the
-            # legacy/live mixed shapes once before the 2.3 completed-day rebuild.
             await _clear_statistics(
                 hass,
                 [external_id, usage_entity, standing_entity],
@@ -476,7 +561,7 @@ async def _reconcile_locked(
         await _save_tariff_analysis(hass, site_id, tariff_analysis)
     if imported:
         _LOGGER.info(
-            "Reconciled Glowmarkt completed cost days: %s",
+            "Reconciled tariff-priced completed cost days: %s",
             ", ".join(
                 f"{commodity}={days} day(s)" for commodity, days in imported.items()
             ),
@@ -484,13 +569,27 @@ async def _reconcile_locked(
     return True
 
 
+async def _open_day_consumption(
+    coordinator: GlowmarktDataUpdateCoordinator,
+    resource_id: str,
+    now_uk: datetime,
+) -> DailyReading | None:
+    start = now_uk.replace(hour=0, minute=0, second=0, microsecond=0)
+    return await coordinator.api_client._fetch_day_reading(  # noqa: SLF001
+        resource_id,
+        start,
+        now_uk,
+    )
+
+
 async def _import_open_day_locked(
     hass: HomeAssistant,
     coordinator: GlowmarktDataUpdateCoordinator,
     site_id: str,
     now_uk: datetime,
+    tariff_ledger: dict[str, Any],
 ) -> None:
-    """Overwrite today's provisional Energy cost rows from all published PT30M data."""
+    """Publish today's tariff-priced usage and standing-charge stack."""
     _store, state = await _load_store(hass, site_id)
     if state.get("_ingestion_version") != COST_INGESTION_SCHEMA_VERSION:
         return
@@ -498,8 +597,15 @@ async def _import_open_day_locked(
     today = now_uk.date().isoformat()
     yesterday = _yesterday(now_uk)
     commodity_state = state.get("commodities", {})
+    tariff_rows_by_commodity = tariff_ledger.get("commodities", {})
 
-    for commodity, (cost_classifier, _daily, _usage, _standing) in COMPONENT_KEYS.items():
+    for commodity, (
+        cost_classifier,
+        consumption_classifier,
+        _daily,
+        usage_key,
+        standing_key,
+    ) in COMPONENT_KEYS.items():
         if cost_classifier not in coordinator.resources:
             continue
         previous = commodity_state.get(commodity, {})
@@ -515,21 +621,69 @@ async def _import_open_day_locked(
         ):
             continue
 
-        baseline = float(previous.get("completed_total_sum_gbp", 0.0))
-        stats = build_total_cost_statistics([breakdown], baseline=baseline)
-        if not stats:
+        consumption: list[DailyReading] = []
+        consumption_resource = coordinator.resources.get(consumption_classifier)
+        if consumption_resource is not None:
+            current = await _open_day_consumption(
+                coordinator,
+                consumption_resource["resource_id"],
+                now_uk,
+            )
+            if current is not None:
+                consumption.append(current)
+
+        rows = tariff_rows_by_commodity.get(commodity, [])
+        periods = derive_tariff_periods(
+            rows if isinstance(rows, list) else [],
+            [breakdown],
+            configured_standing_gbp=coordinator.tariff_config.get(
+                f"{commodity}_standing_charge"
+            ),
+            configured_rate_gbp_per_kwh=coordinator.tariff_config.get(
+                f"{commodity}_rate"
+            ),
+        )
+        priced, pricing = price_cost_history([breakdown], consumption, periods)
+        if not priced:
             continue
-        async_add_external_statistics(
-            hass,
-            _external_cost_metadata(site_id, commodity),
-            stats,
+        open_breakdown = priced[0]
+
+        total_baseline = float(previous.get("completed_total_sum_gbp", 0.0))
+        usage_baseline = float(previous.get("usage_sum_gbp", 0.0))
+        standing_baseline = float(previous.get("standing_sum_gbp", 0.0))
+        total_stats = build_total_cost_statistics([open_breakdown], baseline=total_baseline)
+        usage_stats, standing_stats = build_component_statistics(
+            [open_breakdown],
+            usage_baseline=usage_baseline,
+            standing_baseline=standing_baseline,
         )
-        _LOGGER.debug(
-            "Imported %s provisional PT30M cost intervals for %s (%s)",
-            len(breakdown.usage_intervals),
-            commodity,
-            today,
-        )
+
+        usage_entity = await _entity_id(hass, site_id, usage_key)
+        standing_entity = await _entity_id(hass, site_id, standing_key)
+        if usage_entity is None or standing_entity is None:
+            continue
+
+        if total_stats:
+            async_add_external_statistics(
+                hass,
+                _external_cost_metadata(site_id, commodity),
+                total_stats,
+            )
+        if usage_stats:
+            async_import_statistics(hass, _metadata(usage_entity), usage_stats)
+        if standing_stats:
+            async_import_statistics(hass, _metadata(standing_entity), standing_stats)
+
+        if pricing:
+            item = pricing[0]
+            _LOGGER.debug(
+                "Published %s open-day cost stack: rate=%s p/kWh, standing=%s p, "
+                "usage_source=%s",
+                commodity,
+                item.get("unit_rate_pence_per_kwh"),
+                item.get("standing_pence"),
+                item.get("usage_source"),
+            )
 
 
 async def async_sync_cost_ingestion(
@@ -539,8 +693,10 @@ async def async_sync_cost_ingestion(
     *,
     tariff_ledger: dict[str, Any] | None = None,
 ) -> None:
-    """Reconcile closed days first, then publish the open day's PT30M cost."""
+    """Reconcile tariff-priced closed days, then publish today's stack."""
     async with coordinator.cost_history_lock:
+        if tariff_ledger is None:
+            tariff_ledger = await _load_tariff_ledger(hass, site_id)
         ready = await _reconcile_locked(
             hass,
             coordinator,
@@ -553,6 +709,7 @@ async def async_sync_cost_ingestion(
                 coordinator,
                 site_id,
                 datetime.now(UK_TZ),
+                tariff_ledger,
             )
 
 
@@ -561,7 +718,7 @@ async def async_cost_ingestion_worker(
     coordinator: GlowmarktDataUpdateCoordinator,
     site_id: str,
 ) -> None:
-    """Prime cost history after setup and provide a low-frequency safety sync."""
+    """Fetch tariff first, then continuously reconcile cost statistics."""
     await asyncio.sleep(INITIAL_DELAY_SECONDS)
 
     tariff_ledger: dict[str, Any] | None = None
