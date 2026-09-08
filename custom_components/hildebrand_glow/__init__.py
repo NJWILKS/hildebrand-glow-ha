@@ -24,6 +24,8 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import GlowmarktDataUpdateCoordinator
+from .cost_ingestion import async_cost_ingestion_worker
+from .identity import site_identity
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
@@ -85,6 +87,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     coordinator.schedule_history_backfill()
+
+    site_id = site_identity(
+        entry.data.get(CONF_VIRTUAL_ENTITY),
+        entry.entry_id,
+    )
+    cost_ingestion_task = hass.async_create_background_task(
+        async_cost_ingestion_worker(hass, coordinator, site_id),
+        name=f"{DOMAIN} cost ingestion",
+    )
+    entry.async_on_unload(cost_ingestion_task.cancel)
+
     entry.async_on_unload(entry.add_update_listener(async_update_options))
     return True
 
