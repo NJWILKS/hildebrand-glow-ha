@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 import pytest
@@ -46,6 +47,68 @@ def _expected_epochs(start: datetime, end: datetime) -> list[int]:
     start_epoch = int(start.astimezone(timezone.utc).timestamp())
     end_epoch = int(end.astimezone(timezone.utc).timestamp())
     return list(range(start_epoch, end_epoch, 1800))
+
+
+def _number(value: Any) -> float | None:
+    """Parse a numeric tariff field without exposing its value in diagnostics."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _sanitised_tariff_shape(row: dict[str, Any]) -> dict[str, Any]:
+    """Describe tariff structure without logging rates, charges, IDs or usage."""
+    rates: set[float] = set()
+    has_time = False
+    has_tier = False
+    has_dynamic = False
+    standing_present = False
+    plan_detail_keys: set[str] = set()
+
+    def walk(value: Any) -> None:
+        nonlocal has_time, has_tier, has_dynamic, standing_present
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"rate", "tourate"}:
+                    parsed = _number(child)
+                    if parsed is not None:
+                        rates.add(round(parsed, 6))
+                elif key in {"standing", "standingCharge"}:
+                    standing_present = standing_present or _number(child) is not None
+                elif key == "time":
+                    has_time = has_time or child not in (None, "", False)
+                elif key == "tier":
+                    has_tier = has_tier or child not in (None, "", False)
+                elif key == "dynamic":
+                    has_dynamic = has_dynamic or child not in (None, "", False)
+                if key == "planDetail" and isinstance(child, list):
+                    for detail in child:
+                        if isinstance(detail, dict):
+                            plan_detail_keys.update(str(item) for item in detail)
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(row.get("plan", row))
+    raw_effective = row.get("effectiveDate") or row.get("from") or row.get("effective")
+    effective_day = str(raw_effective)[:10] if raw_effective else None
+    return {
+        "effective_day": effective_day,
+        "rate_count": len(rates),
+        "has_time": has_time,
+        "has_tier": has_tier,
+        "has_dynamic": has_dynamic,
+        "standing_present": standing_present,
+        "plan_detail_keys": sorted(plan_detail_keys),
+    }
 
 
 async def _known_electricity_resources(
@@ -227,8 +290,24 @@ async def test_live_account_matches_known_electricity_export() -> None:
         if not priced or not diagnostics:
             pytest.fail("Live contract: tariff pricing produced no result")
         diagnostic = diagnostics[0]
+        tariff_shapes = [
+            _sanitised_tariff_shape(row)
+            for row in tariff_rows
+            if isinstance(row, dict)
+        ]
+        print(
+            "Live tariff classification diagnostics: "
+            f"rate_kind={diagnostic['rate_kind']}; "
+            f"unit_rate_resolved={diagnostic['unit_rate_pence_per_kwh'] is not None}; "
+            f"standing_resolved={diagnostic['standing_pence'] is not None}; "
+            f"tariff_shapes={json.dumps(tariff_shapes, sort_keys=True)}"
+        )
         if diagnostic["rate_kind"] != "flat":
-            pytest.fail("Live contract: known account no longer exposes a flat tariff")
+            pytest.fail(
+                "Live contract: known-account flat-tariff classification mismatch; "
+                f"rate_kind={diagnostic['rate_kind']}; "
+                f"sanitised tariff shapes={json.dumps(tariff_shapes, sort_keys=True)}"
+            )
         if diagnostic["unit_rate_pence_per_kwh"] is None:
             pytest.fail("Live contract: flat tariff unit rate was not resolved")
         if diagnostic["standing_pence"] is None:
