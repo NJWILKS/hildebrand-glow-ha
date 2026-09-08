@@ -25,6 +25,12 @@ from custom_components.hildebrand_glow.cost_ingestion import (
 from custom_components.hildebrand_glow.costing import CostBreakdown
 
 
+@pytest.fixture
+def mock_recorder_before_hass(recorder_db_url: str) -> None:
+    """Use the real test Recorder rather than the plugin's pre-hass recorder mock."""
+    assert recorder_db_url
+
+
 def _reading(day: str, values: list[float]) -> DailyReading:
     start = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
     return DailyReading(
