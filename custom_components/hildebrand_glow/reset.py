@@ -11,7 +11,7 @@ from homeassistant.helpers.storage import Store
 
 from .const import CONF_VIRTUAL_ENTITY, DOMAIN
 from .coordinator import CUMULATIVE_STORAGE_VERSION
-from .cost_history import (
+from .cost_ingestion import (
     COST_HISTORY_STORAGE_VERSION,
     TARIFF_HISTORY_STORAGE_VERSION,
     energy_cost_statistic_id,
