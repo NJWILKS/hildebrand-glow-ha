@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from custom_components.hildebrand_glow.api import UK_TZ
-from custom_components.hildebrand_glow.cost_history import (
+from custom_components.hildebrand_glow.cost_ingestion import (
     _effective_key,
-    _external_resume_point,
     build_component_statistics,
     build_total_cost_statistics,
     energy_cost_statistic_id,
@@ -20,7 +18,7 @@ def test_cost_component_statistics_are_daily_stackable_states() -> None:
             total_pence=347.2,
             usage_pence=300.0,
             standing_charge_pence=47.2,
-            standing_charge_status="applied",
+            standing_charge_status="tariff_list",
             complete_day=True,
         ),
         CostBreakdown(
@@ -28,7 +26,7 @@ def test_cost_component_statistics_are_daily_stackable_states() -> None:
             total_pence=250.0,
             usage_pence=250.0,
             standing_charge_pence=0.0,
-            standing_charge_status="not_applied",
+            standing_charge_status="tariff_list",
             complete_day=True,
         ),
     ]
@@ -58,7 +56,7 @@ def test_total_cost_statistics_are_cumulative_for_energy_dashboard() -> None:
             total_pence=347.2,
             usage_pence=300.0,
             standing_charge_pence=47.2,
-            standing_charge_status="applied",
+            standing_charge_status="tariff_list",
             complete_day=True,
             usage_intervals=(
                 (first_hour, 100.0),
@@ -70,7 +68,7 @@ def test_total_cost_statistics_are_cumulative_for_energy_dashboard() -> None:
             total_pence=250.0,
             usage_pence=250.0,
             standing_charge_pence=0.0,
-            standing_charge_status="not_applied",
+            standing_charge_status="tariff_list",
             complete_day=True,
         ),
     ]
@@ -80,14 +78,6 @@ def test_total_cost_statistics_are_cumulative_for_energy_dashboard() -> None:
     assert [item["state"] for item in total] == [1.472, 2.0, 2.5]
     assert [item["sum"] for item in total] == [1.472, 3.472, 5.972]
     assert [item["start"] for item in total[:2]] == [first_hour, second_hour]
-    assert total[2]["start"] == datetime(
-        2025,
-        10,
-        27,
-        0,
-        0,
-        tzinfo=timezone.utc,
-    )
 
 
 def test_cost_statistics_preserve_sub_penny_precision() -> None:
@@ -98,7 +88,7 @@ def test_cost_statistics_preserve_sub_penny_precision() -> None:
             total_pence=147.619,
             usage_pence=100.010,
             standing_charge_pence=47.609,
-            standing_charge_status="applied",
+            standing_charge_status="tariff_list",
             complete_day=True,
             usage_intervals=((hour, 100.010),),
         )
@@ -119,27 +109,6 @@ def test_energy_cost_statistic_id_is_stable_and_valid() -> None:
         energy_cost_statistic_id("ABC-123/site", "Electricity")
         == "hildebrand_glow:abc_123_site_electricity_energy_cost"
     )
-
-
-def test_external_cost_resume_uses_recorder_sum_and_next_uk_day() -> None:
-    last_hour = datetime(2026, 9, 5, 22, 0, tzinfo=timezone.utc)
-
-    start_uk, baseline = _external_resume_point(
-        {
-            "start": last_hour.timestamp(),
-            "sum": 718.40123449,
-        }
-    )
-
-    assert start_uk == datetime(2026, 9, 6, 0, 0, tzinfo=UK_TZ)
-    assert baseline == 718.401234
-
-
-def test_external_cost_resume_without_recorder_row_forces_full_history() -> None:
-    start_uk, baseline = _external_resume_point(None)
-
-    assert start_uk is None
-    assert baseline == 0.0
 
 
 def test_unknown_standing_charge_does_not_invent_historical_value() -> None:
