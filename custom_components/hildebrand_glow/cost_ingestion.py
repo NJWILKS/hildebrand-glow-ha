@@ -1,0 +1,615 @@
+"""Rolling and completed-day cost ingestion for Hildebrand Glow."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Any
+
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    async_import_statistics,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.storage import Store
+
+from .api import GlowmarktApiError, UK_TZ
+from .const import (
+    CLASSIFIER_ELECTRICITY_COST,
+    CLASSIFIER_GAS_COST,
+    DOMAIN,
+    GLOWMARKT_API_BASE,
+)
+from .costing import CostBreakdown, get_cost_history
+from .identity import sensor_unique_id
+from .tariff import derive_tariff_periods, normalise_cost_history, tariff_period_as_dict
+
+if TYPE_CHECKING:
+    from .coordinator import GlowmarktDataUpdateCoordinator
+
+_LOGGER = logging.getLogger(__name__)
+
+COST_HISTORY_STORAGE_VERSION = 1
+TARIFF_HISTORY_STORAGE_VERSION = 1
+COST_BACKFILL_SCHEMA_VERSION = 6
+COST_INGESTION_SCHEMA_VERSION = 1
+INITIAL_DELAY_SECONDS = 30
+COST_HISTORY_REFRESH_SECONDS = 6 * 60 * 60
+TARIFF_REFRESH_SECONDS = 24 * 60 * 60
+STAT_PRECISION = 6
+
+COMPONENT_KEYS = {
+    "electricity": (
+        CLASSIFIER_ELECTRICITY_COST,
+        "electricity_daily_cost",
+        "electricity_usage_cost",
+        "electricity_standing_charge",
+    ),
+    "gas": (
+        CLASSIFIER_GAS_COST,
+        "gas_daily_cost",
+        "gas_usage_cost",
+        "gas_standing_charge",
+    ),
+}
+
+
+def _round_stat(value: float) -> float:
+    return round(float(value), STAT_PRECISION)
+
+
+def _gbp_from_pence(value: float) -> float:
+    return _round_stat(float(value) / 100.0)
+
+
+def _metadata(entity_id: str) -> StatisticMetaData:
+    return StatisticMetaData(
+        has_sum=True,
+        mean_type=StatisticMeanType.NONE,
+        name=None,
+        source="recorder",
+        statistic_id=entity_id,
+        unit_class=None,
+        unit_of_measurement="GBP",
+    )
+
+
+def energy_cost_statistic_id(site_id: str, commodity: str) -> str:
+    """Return the stable external Energy cost statistic ID."""
+    safe_site = re.sub(r"[^a-z0-9_]+", "_", site_id.lower()).strip("_")
+    safe_commodity = re.sub(r"[^a-z0-9_]+", "_", commodity.lower()).strip("_")
+    return f"{DOMAIN}:{safe_site}_{safe_commodity}_energy_cost"
+
+
+def _external_cost_metadata(site_id: str, commodity: str) -> StatisticMetaData:
+    return StatisticMetaData(
+        has_sum=True,
+        mean_type=StatisticMeanType.NONE,
+        name=f"Hildebrand Glow {commodity.title()} Energy Cost",
+        source=DOMAIN,
+        statistic_id=energy_cost_statistic_id(site_id, commodity),
+        unit_class=None,
+        unit_of_measurement="GBP",
+    )
+
+
+def _day_start_utc(day: str) -> datetime:
+    return (
+        datetime.fromisoformat(day)
+        .replace(tzinfo=UK_TZ)
+        .astimezone(timezone.utc)
+    )
+
+
+def _hourly_pence(breakdown: CostBreakdown) -> dict[datetime, float]:
+    hourly: dict[datetime, float] = {}
+    for timestamp, value_pence in breakdown.usage_intervals:
+        hour_start = timestamp.replace(minute=0, second=0, microsecond=0)
+        hourly[hour_start] = hourly.get(hour_start, 0.0) + float(value_pence)
+    return hourly
+
+
+def build_total_cost_statistics(
+    history: list[CostBreakdown],
+    *,
+    baseline: float = 0.0,
+) -> list[StatisticData]:
+    """Build hourly Energy cost rows with a monotonic cumulative sum."""
+    running = _round_stat(baseline)
+    stats: list[StatisticData] = []
+
+    for breakdown in history:
+        total_gbp = _gbp_from_pence(breakdown.total_pence)
+        hourly_pence = _hourly_pence(breakdown)
+
+        if not hourly_pence:
+            running = _round_stat(running + total_gbp)
+            stats.append(
+                StatisticData(
+                    start=_day_start_utc(breakdown.day),
+                    state=total_gbp,
+                    sum=running,
+                )
+            )
+            continue
+
+        ordered_hours = sorted(hourly_pence)
+        residual_pence = float(breakdown.total_pence) - sum(hourly_pence.values())
+        if residual_pence:
+            hourly_pence[ordered_hours[0]] += residual_pence
+
+        day_states = [_gbp_from_pence(hourly_pence[hour]) for hour in ordered_hours]
+        correction = _round_stat(total_gbp - sum(day_states))
+        if correction:
+            day_states[-1] = _round_stat(day_states[-1] + correction)
+
+        for hour_start, state in zip(ordered_hours, day_states, strict=True):
+            running = _round_stat(running + state)
+            stats.append(
+                StatisticData(
+                    start=hour_start,
+                    state=state,
+                    sum=running,
+                )
+            )
+
+    return stats
+
+
+def build_component_statistics(
+    history: list[CostBreakdown],
+    *,
+    usage_baseline: float = 0.0,
+    standing_baseline: float = 0.0,
+) -> tuple[list[StatisticData], list[StatisticData]]:
+    """Build hourly rows matching the live daily-reset component sensors.
+
+    Usage ``state`` is cumulative within each UK-local billing day while ``sum``
+    remains cumulative across days. Standing charge appears once in ``sum`` and
+    remains a stable daily ``state`` across the day's hourly rows. This mirrors
+    Recorder's live TOTAL + last_reset semantics and lets completed-day imports
+    overwrite the live provisional day without mixing incompatible shapes.
+    """
+    usage_running = _round_stat(usage_baseline)
+    standing_running = _round_stat(standing_baseline)
+    usage_stats: list[StatisticData] = []
+    standing_stats: list[StatisticData] = []
+
+    for breakdown in history:
+        hourly_pence = _hourly_pence(breakdown)
+        ordered_hours = sorted(hourly_pence)
+        if not ordered_hours:
+            ordered_hours = [_day_start_utc(breakdown.day)]
+
+        if breakdown.usage_pence is not None:
+            target_usage = _gbp_from_pence(breakdown.usage_pence)
+            if hourly_pence:
+                increments = [_gbp_from_pence(hourly_pence[hour]) for hour in ordered_hours]
+                correction = _round_stat(target_usage - sum(increments))
+                if correction:
+                    increments[-1] = _round_stat(increments[-1] + correction)
+            else:
+                increments = [target_usage]
+
+            day_state = 0.0
+            for hour_start, increment in zip(ordered_hours, increments, strict=True):
+                day_state = _round_stat(day_state + increment)
+                usage_running = _round_stat(usage_running + increment)
+                usage_stats.append(
+                    StatisticData(
+                        start=hour_start,
+                        state=day_state,
+                        sum=usage_running,
+                    )
+                )
+
+        if breakdown.standing_charge_pence is not None:
+            standing_gbp = _gbp_from_pence(breakdown.standing_charge_pence)
+            standing_running = _round_stat(standing_running + standing_gbp)
+            for hour_start in ordered_hours:
+                standing_stats.append(
+                    StatisticData(
+                        start=hour_start,
+                        state=standing_gbp,
+                        sum=standing_running,
+                    )
+                )
+
+    return usage_stats, standing_stats
+
+
+async def _clear_statistics(hass: HomeAssistant, statistic_ids: list[str]) -> None:
+    if not statistic_ids:
+        return
+    done = asyncio.Event()
+
+    def _done() -> None:
+        hass.loop.call_soon_threadsafe(done.set)
+
+    get_instance(hass).async_clear_statistics(statistic_ids, on_done=_done)
+    await done.wait()
+
+
+async def _entity_id(
+    hass: HomeAssistant,
+    site_id: str,
+    sensor_key: str,
+) -> str | None:
+    registry = er.async_get(hass)
+    return registry.async_get_entity_id(
+        "sensor",
+        DOMAIN,
+        sensor_unique_id(site_id, sensor_key, None),
+    )
+
+
+async def _load_store(hass: HomeAssistant, site_id: str) -> tuple[Store, dict[str, Any]]:
+    store = Store(
+        hass,
+        COST_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_cost_history",
+    )
+    return store, await store.async_load() or {}
+
+
+async def _load_tariff_ledger(hass: HomeAssistant, site_id: str) -> dict[str, Any]:
+    store = Store(
+        hass,
+        TARIFF_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_tariff_history",
+    )
+    return await store.async_load() or {}
+
+
+async def _save_tariff_analysis(
+    hass: HomeAssistant,
+    site_id: str,
+    analysis: dict[str, list[dict[str, Any]]],
+) -> None:
+    store = Store(
+        hass,
+        TARIFF_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_tariff_history",
+    )
+    state = await store.async_load() or {}
+    state["analysis"] = analysis
+    await store.async_save(state)
+
+
+def _effective_key(item: dict[str, Any]) -> str:
+    return str(
+        item.get("effectiveDate")
+        or item.get("from")
+        or item.get("effective")
+        or ""
+    )
+
+
+async def _refresh_tariff_ledger(
+    hass: HomeAssistant,
+    coordinator: GlowmarktDataUpdateCoordinator,
+    site_id: str,
+) -> dict[str, Any]:
+    ledger: dict[str, list[dict[str, Any]]] = {}
+    for commodity, (cost_classifier, _daily, _usage, _standing) in COMPONENT_KEYS.items():
+        resource = coordinator.resources.get(cost_classifier)
+        if not resource:
+            continue
+        data = await coordinator.api_client._get_json(  # noqa: SLF001
+            f"{GLOWMARKT_API_BASE}/resource/{resource['resource_id']}/tariff-list"
+        )
+        if not isinstance(data, dict) or data.get("status") not in (None, "OK"):
+            raise GlowmarktApiError("Glowmarkt tariff-list query returned an error")
+        raw = data.get("data") or []
+        if isinstance(raw, list):
+            ledger[commodity] = sorted(
+                [item for item in raw if isinstance(item, dict)],
+                key=_effective_key,
+            )
+
+    result: dict[str, Any] = {
+        "updated_at": datetime.now(UK_TZ).isoformat(),
+        "commodities": ledger,
+    }
+    store = Store(
+        hass,
+        TARIFF_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_tariff_history",
+    )
+    existing = await store.async_load() or {}
+    if "analysis" in existing:
+        result["analysis"] = existing["analysis"]
+    await store.async_save(result)
+    return result
+
+
+def _day_start(day: str) -> datetime:
+    return datetime.fromisoformat(day).replace(tzinfo=UK_TZ)
+
+
+def _next_day(day: str) -> datetime:
+    return _day_start(day) + timedelta(days=1)
+
+
+def _yesterday(now_uk: datetime) -> str:
+    today = now_uk.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (today - timedelta(days=1)).date().isoformat()
+
+
+def _settled_prefix(history: list[CostBreakdown]) -> list[CostBreakdown]:
+    """Stop at the first day for which Glow has not published P1D yet."""
+    settled: list[CostBreakdown] = []
+    for breakdown in history:
+        if breakdown.standing_charge_status == "daily_pending":
+            break
+        settled.append(breakdown)
+    return settled
+
+
+async def _reconcile_locked(
+    hass: HomeAssistant,
+    coordinator: GlowmarktDataUpdateCoordinator,
+    site_id: str,
+    tariff_ledger: dict[str, Any] | None,
+) -> bool:
+    """Reconcile every available completed day."""
+    store, state = await _load_store(hass, site_id)
+    full_backfill = state.get("_ingestion_version") != COST_INGESTION_SCHEMA_VERSION
+    commodity_state = state.setdefault("commodities", {})
+    imported: dict[str, int] = {}
+    tariff_analysis: dict[str, list[dict[str, Any]]] = {}
+
+    if tariff_ledger is None:
+        tariff_ledger = await _load_tariff_ledger(hass, site_id)
+    tariff_rows_by_commodity = tariff_ledger.get("commodities", {})
+
+    for commodity, (
+        cost_classifier,
+        _daily_key,
+        usage_key,
+        standing_key,
+    ) in COMPONENT_KEYS.items():
+        resource = coordinator.resources.get(cost_classifier)
+        if not resource:
+            continue
+
+        usage_entity = await _entity_id(hass, site_id, usage_key)
+        standing_entity = await _entity_id(hass, site_id, standing_key)
+        if usage_entity is None or standing_entity is None:
+            _LOGGER.debug(
+                "Cost component entities not registered for %s; reconciliation deferred",
+                commodity,
+            )
+            return False
+
+        previous = commodity_state.get(commodity, {}) if not full_backfill else {}
+        completed_day = previous.get("last_completed_day") or previous.get("last_day")
+        total_baseline = float(
+            previous.get(
+                "completed_total_sum_gbp",
+                previous.get("total_sum_gbp", 0.0),
+            )
+        )
+        usage_baseline = float(previous.get("usage_sum_gbp", 0.0))
+        standing_baseline = float(previous.get("standing_sum_gbp", 0.0))
+        start_uk = _next_day(completed_day) if completed_day and not full_backfill else None
+
+        history = await get_cost_history(
+            coordinator.api_client,
+            resource["resource_id"],
+            start_uk=start_uk,
+        )
+        history = _settled_prefix(history)
+        if not history:
+            continue
+
+        configured_standing = coordinator.tariff_config.get(
+            f"{commodity}_standing_charge"
+        )
+        configured_rate = coordinator.tariff_config.get(f"{commodity}_rate")
+        rows = tariff_rows_by_commodity.get(commodity, [])
+        periods = derive_tariff_periods(
+            rows if isinstance(rows, list) else [],
+            history,
+            configured_standing_gbp=configured_standing,
+            configured_rate_gbp_per_kwh=configured_rate,
+        )
+        tariff_analysis[commodity] = [tariff_period_as_dict(item) for item in periods]
+        history = normalise_cost_history(history, periods)
+
+        total_stats = build_total_cost_statistics(history, baseline=total_baseline)
+        usage_stats, standing_stats = build_component_statistics(
+            history,
+            usage_baseline=usage_baseline,
+            standing_baseline=standing_baseline,
+        )
+        external_id = energy_cost_statistic_id(site_id, commodity)
+
+        if full_backfill:
+            # These statistics are entirely reconstructable from Bright. Clear the
+            # legacy/live mixed shapes once before the 2.3 completed-day rebuild.
+            await _clear_statistics(
+                hass,
+                [external_id, usage_entity, standing_entity],
+            )
+
+        if total_stats:
+            async_add_external_statistics(
+                hass,
+                _external_cost_metadata(site_id, commodity),
+                total_stats,
+            )
+        if usage_stats:
+            async_import_statistics(hass, _metadata(usage_entity), usage_stats)
+        if standing_stats:
+            async_import_statistics(hass, _metadata(standing_entity), standing_stats)
+
+        commodity_state[commodity] = {
+            "last_completed_day": history[-1].day,
+            "completed_total_sum_gbp": (
+                float(total_stats[-1]["sum"]) if total_stats else total_baseline
+            ),
+            "usage_sum_gbp": (
+                float(usage_stats[-1]["sum"]) if usage_stats else usage_baseline
+            ),
+            "standing_sum_gbp": (
+                float(standing_stats[-1]["sum"])
+                if standing_stats
+                else standing_baseline
+            ),
+        }
+        imported[commodity] = len(history)
+
+    state["_backfilled"] = True
+    state["_backfilled_version"] = COST_BACKFILL_SCHEMA_VERSION
+    state["_ingestion_version"] = COST_INGESTION_SCHEMA_VERSION
+    await store.async_save(state)
+    if tariff_analysis:
+        await _save_tariff_analysis(hass, site_id, tariff_analysis)
+    if imported:
+        _LOGGER.info(
+            "Reconciled Glowmarkt completed cost days: %s",
+            ", ".join(
+                f"{commodity}={days} day(s)" for commodity, days in imported.items()
+            ),
+        )
+    return True
+
+
+async def _import_open_day_locked(
+    hass: HomeAssistant,
+    coordinator: GlowmarktDataUpdateCoordinator,
+    site_id: str,
+    now_uk: datetime,
+) -> None:
+    """Overwrite today's provisional Energy cost rows from all published PT30M data."""
+    _store, state = await _load_store(hass, site_id)
+    if state.get("_ingestion_version") != COST_INGESTION_SCHEMA_VERSION:
+        return
+
+    today = now_uk.date().isoformat()
+    yesterday = _yesterday(now_uk)
+    commodity_state = state.get("commodities", {})
+
+    for commodity, (cost_classifier, _daily, _usage, _standing) in COMPONENT_KEYS.items():
+        if cost_classifier not in coordinator.resources:
+            continue
+        previous = commodity_state.get(commodity, {})
+        if previous.get("last_completed_day") != yesterday:
+            continue
+
+        breakdown = coordinator.cost_breakdowns.get(commodity)
+        if (
+            breakdown is None
+            or breakdown.complete_day
+            or breakdown.day != today
+            or not breakdown.usage_intervals
+        ):
+            continue
+
+        baseline = float(previous.get("completed_total_sum_gbp", 0.0))
+        stats = build_total_cost_statistics([breakdown], baseline=baseline)
+        if not stats:
+            continue
+        async_add_external_statistics(
+            hass,
+            _external_cost_metadata(site_id, commodity),
+            stats,
+        )
+        _LOGGER.debug(
+            "Imported %s provisional PT30M cost intervals for %s (%s)",
+            len(breakdown.usage_intervals),
+            commodity,
+            today,
+        )
+
+
+async def async_sync_cost_ingestion(
+    hass: HomeAssistant,
+    coordinator: GlowmarktDataUpdateCoordinator,
+    site_id: str,
+    *,
+    tariff_ledger: dict[str, Any] | None = None,
+) -> None:
+    """Reconcile closed days first, then publish the open day's PT30M cost."""
+    async with coordinator.cost_history_lock:
+        ready = await _reconcile_locked(
+            hass,
+            coordinator,
+            site_id,
+            tariff_ledger,
+        )
+        if ready:
+            await _import_open_day_locked(
+                hass,
+                coordinator,
+                site_id,
+                datetime.now(UK_TZ),
+            )
+
+
+async def async_cost_ingestion_worker(
+    hass: HomeAssistant,
+    coordinator: GlowmarktDataUpdateCoordinator,
+    site_id: str,
+) -> None:
+    """Prime cost history after setup and provide a low-frequency safety sync."""
+    await asyncio.sleep(INITIAL_DELAY_SECONDS)
+
+    tariff_ledger: dict[str, Any] | None = None
+    try:
+        tariff_ledger = await _refresh_tariff_ledger(hass, coordinator, site_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOGGER.exception("Glowmarkt tariff-history refresh failed")
+
+    try:
+        await async_sync_cost_ingestion(
+            hass,
+            coordinator,
+            site_id,
+            tariff_ledger=tariff_ledger,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOGGER.exception("Glowmarkt cost ingestion sync failed")
+
+    elapsed = 0
+    while True:
+        await asyncio.sleep(COST_HISTORY_REFRESH_SECONDS)
+        elapsed += COST_HISTORY_REFRESH_SECONDS
+        tariff_ledger = None
+        if elapsed >= TARIFF_REFRESH_SECONDS:
+            elapsed = 0
+            try:
+                tariff_ledger = await _refresh_tariff_ledger(
+                    hass,
+                    coordinator,
+                    site_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("Glowmarkt tariff-history refresh failed")
+
+        try:
+            await async_sync_cost_ingestion(
+                hass,
+                coordinator,
+                site_id,
+                tariff_ledger=tariff_ledger,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Glowmarkt cost ingestion sync failed")
