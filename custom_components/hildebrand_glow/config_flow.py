@@ -34,8 +34,9 @@ from .const import (
     DOMAIN,
     MIN_POLL_INTERVAL,
 )
-from .identity import config_unique_id
+from .identity import config_unique_id, site_identity
 from .reset import async_reset_imported_history
+from .tariff_defaults import async_latest_tariff_defaults
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -215,6 +216,21 @@ class HildebrandGlowOptionsFlow(config_entries.OptionsFlow):
             return self.async_create_entry(title="", data=user_input)
 
         current_data = {**self.config_entry.data, **self.config_entry.options}
+        retrieved_tariff = await async_latest_tariff_defaults(
+            self.hass,
+            site_identity(
+                self.config_entry.data.get(CONF_VIRTUAL_ENTITY),
+                self.config_entry.entry_id,
+            ),
+        )
+
+        def _setting_default(key: str, fallback: float) -> float:
+            if key in self.config_entry.options:
+                return float(self.config_entry.options[key])
+            if key in retrieved_tariff:
+                return float(retrieved_tariff[key])
+            return float(current_data.get(key, fallback))
+
         interval_validator = vol.All(
             vol.Coerce(int),
             vol.Range(min=MIN_POLL_INTERVAL, max=1440),
@@ -225,28 +241,28 @@ class HildebrandGlowOptionsFlow(config_entries.OptionsFlow):
                 {
                     vol.Required(
                         CONF_ELECTRICITY_RATE,
-                        default=current_data.get(
+                        default=_setting_default(
                             CONF_ELECTRICITY_RATE,
                             DEFAULT_ELECTRICITY_RATE,
                         ),
                     ): vol.Coerce(float),
                     vol.Required(
                         CONF_ELECTRICITY_STANDING_CHARGE,
-                        default=current_data.get(
+                        default=_setting_default(
                             CONF_ELECTRICITY_STANDING_CHARGE,
                             DEFAULT_ELECTRICITY_STANDING_CHARGE,
                         ),
                     ): vol.Coerce(float),
                     vol.Required(
                         CONF_GAS_RATE,
-                        default=current_data.get(
+                        default=_setting_default(
                             CONF_GAS_RATE,
                             DEFAULT_GAS_RATE,
                         ),
                     ): vol.Coerce(float),
                     vol.Required(
                         CONF_GAS_STANDING_CHARGE,
-                        default=current_data.get(
+                        default=_setting_default(
                             CONF_GAS_STANDING_CHARGE,
                             DEFAULT_GAS_STANDING_CHARGE,
                         ),

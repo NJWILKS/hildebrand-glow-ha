@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import GlowmarktApiClient
@@ -96,8 +96,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async_cost_ingestion_worker(hass, coordinator, site_id),
         name=f"{DOMAIN} cost ingestion",
     )
-    entry.async_on_unload(cost_ingestion_task.cancel)
 
+    @callback
+    def _cancel_cost_ingestion_task() -> None:
+        cost_ingestion_task.cancel()
+
+    entry.async_on_unload(_cancel_cost_ingestion_task)
     entry.async_on_unload(entry.add_update_listener(async_update_options))
     return True
 
