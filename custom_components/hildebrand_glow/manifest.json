@@ -6,6 +6,7 @@
   ],
   "config_flow": true,
   "dependencies": [
+    "energy",
     "recorder"
   ],
   "documentation": "https://github.com/NJWILKS/hildebrand-glow-ha",
@@ -13,5 +14,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/NJWILKS/hildebrand-glow-ha/issues",
   "requirements": [],
-  "version": "2.3.1"
+  "version": "2.3.4"
 }
