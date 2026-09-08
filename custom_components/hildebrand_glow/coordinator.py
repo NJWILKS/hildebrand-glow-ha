@@ -60,7 +60,7 @@ COMMODITY_CLASSIFIERS = {
     ),
 }
 CUMULATIVE_STORAGE_VERSION = 1
-CUMULATIVE_BACKFILL_SCHEMA_VERSION = 3
+CUMULATIVE_BACKFILL_SCHEMA_VERSION = 4
 
 
 class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -439,7 +439,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not any(self._entity_id_for(c) for c in CUMULATIVE_CLASSIFIERS):
             return
         self._backfill_started = True
-        self._history_task = self.hass.async_create_task(
+        self._history_task = self.hass.async_create_background_task(
             self._async_backfill_history(),
             name=f"{DOMAIN} history backfill",
         )
@@ -460,13 +460,13 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._history_start_scheduled or self._backfill_started:
             return
         self._history_start_scheduled = True
-        self._delayed_history_task = self.hass.async_create_task(
+        self._delayed_history_task = self.hass.async_create_background_task(
             self._async_delayed_history_start(delay),
             name=f"{DOMAIN} delayed history start",
         )
 
     async def _async_backfill_history(self) -> None:
-        """Import closed historical consumption; Recorder owns the open day."""
+        """Import available closed history; Recorder owns the open day."""
         completed = False
         try:
             async with self._cumulative_lock:
@@ -496,12 +496,13 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Consumption entities not registered; backfill will retry")
                 return
 
-            # v2.3 changes current-day ownership. Clear the old statistic series once
-            # so no v2.1/v2.2 synthetic/live rows can survive the migration.
+            # v2.3.1 changes historical-boundary handling and task ownership. Clear the
+            # prior statistic series once so a failed 2.3 rebuild cannot strand it.
             await self._clear_statistics(entity_ids)
 
             async with self._cumulative_lock:
                 cumulative = await self._load_cumulative()
+                yesterday = datetime.now(UK_TZ).date() - timedelta(days=1)
                 for classifier in CUMULATIVE_CLASSIFIERS:
                     if classifier not in self._resources:
                         continue
@@ -514,13 +515,23 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     readings = history.get(classifier, [])
                     imported_days = 0
                     for reading in readings:
+                        reading_day = date.fromisoformat(reading.day)
                         if not self._reading_is_complete(reading):
+                            if reading_day >= yesterday:
+                                _LOGGER.info(
+                                    "Deferring incomplete trailing %s PT30M day %s",
+                                    classifier,
+                                    reading.day,
+                                )
+                                break
                             _LOGGER.warning(
-                                "Stopping %s history at incomplete PT30M day %s",
+                                "Importing partial historical %s PT30M day %s "
+                                "(%s/%s intervals available)",
                                 classifier,
                                 reading.day,
+                                len(reading.intervals),
+                                self._expected_intervals(reading_day),
                             )
-                            break
                         baseline = self._import_hourly_statistics(
                             entity_id,
                             reading,
