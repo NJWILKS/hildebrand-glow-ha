@@ -14,7 +14,10 @@ from custom_components.hildebrand_glow.const import (
     CLASSIFIER_GAS_CONSUMPTION,
     CLASSIFIER_GAS_COST,
 )
-from custom_components.hildebrand_glow.coordinator import GlowmarktDataUpdateCoordinator
+from custom_components.hildebrand_glow.coordinator import (
+    CUMULATIVE_BACKFILL_SCHEMA_VERSION,
+    GlowmarktDataUpdateCoordinator,
+)
 
 
 @dataclass
@@ -68,6 +71,25 @@ class FakeApi:
                 if classifier in classifiers
             }
 
+        async def fetch_day_reading(
+            resource_id: str,
+            start: datetime,
+            _end: datetime,
+            _days_back: int | None = None,
+        ) -> FakeReading | None:
+            values = {
+                "electricity-resource": 10.0,
+                "gas-resource": 20.0,
+            }
+            value = values.get(resource_id)
+            if value is None:
+                return None
+            return FakeReading(
+                day=start.date().isoformat(),
+                value=value,
+                intervals=[(start.astimezone(timezone.utc), value)],
+            )
+
         async def request_readings(
             resource_id: str,
             start: datetime,
@@ -84,6 +106,7 @@ class FakeApi:
             return [[timestamp, value]]
 
         self.get_readings = AsyncMock(side_effect=get_readings)
+        self._fetch_day_reading = AsyncMock(side_effect=fetch_day_reading)
         self._request_readings = AsyncMock(side_effect=request_readings)
         self.get_available_readings = AsyncMock(return_value={})
 
@@ -115,6 +138,35 @@ def _make_coordinator(
     return coordinator
 
 
+def _seed_ready_consumption(
+    coordinator: GlowmarktDataUpdateCoordinator,
+    completed_day: str = "2026-09-06",
+) -> None:
+    coordinator._store = FakeStore(
+        {
+            "_backfilled": True,
+            "_backfilled_version": CUMULATIVE_BACKFILL_SCHEMA_VERSION,
+            CLASSIFIER_ELECTRICITY_CONSUMPTION: {
+                "day": completed_day,
+                "completed_day": completed_day,
+                "completed_cumulative": 0.0,
+                "cumulative": 0.0,
+                "live_day": None,
+                "live_intervals": 0,
+            },
+            CLASSIFIER_GAS_CONSUMPTION: {
+                "day": completed_day,
+                "completed_day": completed_day,
+                "completed_cumulative": 0.0,
+                "cumulative": 0.0,
+                "live_day": None,
+                "live_intervals": 0,
+            },
+        }
+    )
+    coordinator._entity_id_for = lambda classifier: f"sensor.{classifier.replace('.', '_')}"
+
+
 @pytest.mark.asyncio
 async def test_partial_day_uses_api_cost_without_standing_charge(hass, freezer) -> None:
     freezer.move_to("2026-09-07 12:00:00+01:00")
@@ -137,6 +189,7 @@ async def test_partial_day_uses_api_cost_without_standing_charge(hass, freezer) 
         "complete_day": False,
         "usage_cost_gbp": 2.5,
         "standing_charge_status": "not_applied",
+        "pt30m_intervals": 1,
     }
 
 
@@ -160,9 +213,14 @@ async def test_completed_day_derives_standing_from_p1d_minus_pt30m(hass, freezer
 
 
 @pytest.mark.asyncio
-async def test_api_cost_failure_falls_back_without_taking_consumption_offline(hass) -> None:
+async def test_api_cost_failure_falls_back_without_taking_consumption_offline(
+    hass,
+    freezer,
+) -> None:
+    freezer.move_to("2026-09-07 12:00:00+01:00")
     api = FakeApi()
     coordinator = _make_coordinator(hass, api)
+    _seed_ready_consumption(coordinator)
     api._request_readings.side_effect = GlowmarktApiError("rate limited")
 
     data = await coordinator._async_update_data()
@@ -193,16 +251,18 @@ async def test_electricity_only_site_does_not_add_gas_standing_charge(hass, free
 
 
 @pytest.mark.asyncio
-async def test_coordinator_keeps_last_good_value_when_consumption_returns_none(hass) -> None:
+async def test_coordinator_keeps_last_good_value_when_consumption_returns_none(
+    hass,
+    freezer,
+) -> None:
+    freezer.move_to("2026-09-07 12:00:00+01:00")
     api = FakeApi()
     coordinator = _make_coordinator(hass, api)
+    _seed_ready_consumption(coordinator)
 
     first = await coordinator._async_update_data()
 
-    async def empty_readings(classifiers: set[str] | None = None):
-        return {classifier: None for classifier in classifiers or set()}
-
-    api.get_readings.side_effect = empty_readings
+    api._fetch_day_reading.side_effect = lambda *_args, **_kwargs: None
     second = await coordinator._async_update_data()
 
     assert second["readings"] == first["readings"]
@@ -270,12 +330,18 @@ async def test_accumulation_counts_each_calendar_day_once_across_restart(hass) -
     )
     assert shared_state[CLASSIFIER_ELECTRICITY_CONSUMPTION] == {
         "day": "2026-09-05",
+        "completed_day": "2026-09-05",
+        "completed_cumulative": 15.0,
         "cumulative": 15.0,
     }
 
 
 @pytest.mark.asyncio
-async def test_api_cost_resources_refresh_less_often_than_consumption(hass) -> None:
+async def test_api_cost_resources_refresh_less_often_than_consumption(
+    hass,
+    freezer,
+) -> None:
+    freezer.move_to("2026-09-07 12:00:00+01:00")
     api = FakeApi()
     coordinator = _make_coordinator(
         hass,
@@ -283,17 +349,17 @@ async def test_api_cost_resources_refresh_less_often_than_consumption(hass) -> N
         consumption_interval_minutes=15,
         cost_interval_minutes=60,
     )
+    _seed_ready_consumption(coordinator)
 
     await coordinator._async_update_data()
     first_cost_calls = api._request_readings.await_count
     await coordinator._async_update_data()
 
-    requested = [call.args[0] for call in api.get_readings.await_args_list]
-    consumption_set = {
-        CLASSIFIER_ELECTRICITY_CONSUMPTION,
-        CLASSIFIER_GAS_CONSUMPTION,
-    }
-    assert requested.count(consumption_set) == 2
+    requested_resources = [
+        call.args[0] for call in api._fetch_day_reading.await_args_list
+    ]
+    assert requested_resources.count("electricity-resource") == 2
+    assert requested_resources.count("gas-resource") == 2
     assert api._request_readings.await_count == first_cost_calls
 
 

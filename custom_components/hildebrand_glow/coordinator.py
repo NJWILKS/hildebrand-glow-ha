@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
+from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
@@ -17,7 +18,13 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import DailyReading, GlowmarktApiClient, GlowmarktApiError, GlowmarktAuthError, UK_TZ
+from .api import (
+    DailyReading,
+    GlowmarktApiClient,
+    GlowmarktApiError,
+    GlowmarktAuthError,
+    UK_TZ,
+)
 from .const import (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_ELECTRICITY_COST,
@@ -29,6 +36,7 @@ from .const import (
     HISTORY_START_DELAY_SECONDS,
     MIN_POLL_INTERVAL,
 )
+from .cost_ingestion import async_sync_cost_ingestion
 from .costing import CostBreakdown, get_latest_cost_breakdown
 from .identity import sensor_unique_id, site_identity
 
@@ -52,11 +60,11 @@ COMMODITY_CLASSIFIERS = {
     ),
 }
 CUMULATIVE_STORAGE_VERSION = 1
-CUMULATIVE_BACKFILL_SCHEMA_VERSION = 2
+CUMULATIVE_BACKFILL_SCHEMA_VERSION = 3
 
 
 class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Manage Glowmarkt data, cumulative energy values and history backfill."""
+    """Manage Glowmarkt rolling data, cumulative values and history backfill."""
 
     def __init__(
         self,
@@ -98,8 +106,12 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._cumulative: dict[str, Any] | None = None
         self._cumulative_lock = asyncio.Lock()
+        self._cost_history_lock = asyncio.Lock()
         self._backfill_started = False
         self._history_start_scheduled = False
+        self._entities_ready = False
+        self._history_task: asyncio.Task[Any] | None = None
+        self._delayed_history_task: asyncio.Task[Any] | None = None
 
     def _resource_id_for(self, classifier: str) -> str | None:
         resource = self._resources.get(classifier)
@@ -134,7 +146,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         reading: DailyReading,
         baseline: float,
     ) -> float:
-        """Import a day's shape while preserving TOTAL_INCREASING state semantics."""
+        """Import a closed day's shape using cumulative TOTAL_INCREASING state."""
         hourly: dict[datetime, float] = {}
         for timestamp, value in reading.intervals:
             hour_start = timestamp.replace(minute=0, second=0, microsecond=0)
@@ -160,48 +172,274 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         return round(running, 3)
 
+    async def _clear_statistics(self, statistic_ids: list[str]) -> None:
+        """Clear legacy consumption statistics before a schema rebuild."""
+        if not statistic_ids:
+            return
+        done = asyncio.Event()
+
+        def _done() -> None:
+            self.hass.loop.call_soon_threadsafe(done.set)
+
+        get_instance(self.hass).async_clear_statistics(statistic_ids, on_done=_done)
+        await done.wait()
+
     async def _load_cumulative(self) -> dict[str, Any]:
         if self._cumulative is None:
             self._cumulative = await self._store.async_load() or {}
         return self._cumulative
 
+    @staticmethod
+    def _day_start(day: date) -> datetime:
+        return datetime.combine(day, time.min, tzinfo=UK_TZ)
+
+    @classmethod
+    def _expected_intervals(cls, day: date) -> int:
+        start = cls._day_start(day)
+        end = cls._day_start(day + timedelta(days=1))
+        seconds = (
+            end.astimezone(timezone.utc) - start.astimezone(timezone.utc)
+        ).total_seconds()
+        return int(seconds // (30 * 60))
+
+    @classmethod
+    def _reading_is_complete(cls, reading: DailyReading) -> bool:
+        day = date.fromisoformat(reading.day)
+        timestamps = {
+            timestamp
+            for timestamp, _value in reading.intervals
+            if timestamp.astimezone(UK_TZ).date() == day
+        }
+        return len(timestamps) == cls._expected_intervals(day)
+
+    async def _current_day_reading(
+        self,
+        classifier: str,
+        now_uk: datetime,
+    ) -> DailyReading | None:
+        """Return only published, closed PT30M intervals for the current UK day."""
+        resource_id = self._resource_id_for(classifier)
+        if resource_id is None:
+            return None
+        today_start = now_uk.replace(hour=0, minute=0, second=0, microsecond=0)
+        reading = await self.api_client._fetch_day_reading(  # noqa: SLF001
+            resource_id,
+            today_start,
+            now_uk,
+        )
+        if reading is None:
+            return None
+        intervals = [
+            (timestamp, value)
+            for timestamp, value in reading.intervals
+            if timestamp.astimezone(UK_TZ) + timedelta(minutes=30) <= now_uk
+        ]
+        if not intervals:
+            return None
+        return DailyReading(
+            day=today_start.date().isoformat(),
+            value=round(sum(value for _timestamp, value in intervals), 3),
+            intervals=intervals,
+        )
+
     async def _accumulate(self, classifier: str, reading: DailyReading) -> float:
-        """Count each completed calendar day exactly once, across restarts."""
+        """Compatibility helper for adding one closed day exactly once."""
         async with self._cumulative_lock:
             cumulative = await self._load_cumulative()
             entry = cumulative.get(
                 classifier,
-                {"day": None, "cumulative": 0.0},
+                {
+                    "completed_day": None,
+                    "completed_cumulative": 0.0,
+                    "cumulative": 0.0,
+                },
             )
-            previous_day = entry.get("day")
+            previous_day = entry.get("completed_day") or entry.get("day")
             if previous_day is not None and reading.day <= previous_day:
-                return float(entry["cumulative"])
+                return float(
+                    entry.get("completed_cumulative", entry.get("cumulative", 0.0))
+                )
 
+            baseline = float(
+                entry.get("completed_cumulative", entry.get("cumulative", 0.0))
+            )
             entity_id = self._entity_id_for(classifier)
             if entity_id is None or not reading.intervals:
-                new_total = round(float(entry["cumulative"]) + reading.value, 3)
+                new_total = round(baseline + reading.value, 3)
             else:
                 new_total = self._import_hourly_statistics(
                     entity_id,
                     reading,
-                    float(entry["cumulative"]),
+                    baseline,
                 )
 
             cumulative[classifier] = {
                 "day": reading.day,
+                "completed_day": reading.day,
+                "completed_cumulative": new_total,
                 "cumulative": new_total,
             }
             await self._store.async_save(cumulative)
             return new_total
 
+    async def _refresh_consumption(
+        self,
+        now_uk: datetime,
+    ) -> dict[str, float | None]:
+        """Reconcile closed days, then calculate today's rolling cumulative state."""
+        result: dict[str, float | None] = {
+            classifier: None for classifier in CUMULATIVE_CLASSIFIERS
+        }
+        async with self._cumulative_lock:
+            cumulative = await self._load_cumulative()
+            if (
+                not cumulative.get("_backfilled")
+                or int(cumulative.get("_backfilled_version", 0) or 0)
+                < CUMULATIVE_BACKFILL_SCHEMA_VERSION
+            ):
+                return result
+
+            changed = False
+            today = now_uk.date()
+            today_iso = today.isoformat()
+            yesterday = today - timedelta(days=1)
+
+            for classifier in CUMULATIVE_CLASSIFIERS:
+                if classifier not in self._resources:
+                    continue
+                entry = cumulative.get(
+                    classifier,
+                    {
+                        "completed_day": None,
+                        "completed_cumulative": 0.0,
+                        "cumulative": 0.0,
+                    },
+                )
+                completed_day_raw = entry.get("completed_day") or entry.get("day")
+                if completed_day_raw is None:
+                    continue
+                completed_day = date.fromisoformat(str(completed_day_raw))
+                baseline = float(
+                    entry.get(
+                        "completed_cumulative",
+                        entry.get("cumulative", 0.0),
+                    )
+                )
+                stored_live_day = entry.get("live_day")
+                stored_live_intervals = int(entry.get("live_intervals", 0) or 0)
+                stored_live_total = float(entry.get("cumulative", baseline))
+                entity_id = self._entity_id_for(classifier)
+                resource_id = self._resource_id_for(classifier)
+                if entity_id is None or resource_id is None:
+                    continue
+
+                gap = completed_day + timedelta(days=1)
+                gap_blocked = False
+                reconciled_days = 0
+                while gap <= yesterday:
+                    day_start = self._day_start(gap)
+                    day_end = self._day_start(gap + timedelta(days=1))
+                    reading = await self.api_client._fetch_day_reading(  # noqa: SLF001
+                        resource_id,
+                        day_start,
+                        day_end,
+                    )
+                    if reading is None or not self._reading_is_complete(reading):
+                        _LOGGER.debug(
+                            "Waiting for complete %s PT30M day %s before rolling on",
+                            classifier,
+                            gap,
+                        )
+                        gap_blocked = True
+                        break
+                    baseline = self._import_hourly_statistics(
+                        entity_id,
+                        reading,
+                        baseline,
+                    )
+                    completed_day = gap
+                    reconciled_days += 1
+                    gap += timedelta(days=1)
+                    changed = True
+
+                if reconciled_days:
+                    _LOGGER.info(
+                        "Reconciled Glowmarkt consumption: %s=%s day(s)",
+                        classifier,
+                        reconciled_days,
+                    )
+
+                live_total = baseline
+                live_day: str | None = None
+                live_intervals = 0
+                live_reading: DailyReading | None = None
+
+                if gap_blocked:
+                    # Do not let a late/incomplete closed day roll the TOTAL_INCREASING
+                    # sensor backwards. Hold the last good state until reconciliation.
+                    live_total = stored_live_total
+                    live_day = (
+                        str(stored_live_day) if stored_live_day is not None else None
+                    )
+                    live_intervals = stored_live_intervals
+                elif completed_day == yesterday:
+                    candidate = await self._current_day_reading(classifier, now_uk)
+                    candidate_count = len(candidate.intervals) if candidate else 0
+
+                    if (
+                        stored_live_day == today_iso
+                        and stored_live_intervals > candidate_count
+                    ):
+                        # Bright can transiently return a shorter partial-day window.
+                        # Replaying it would look like a meter reset to Recorder.
+                        live_total = stored_live_total
+                        live_day = today_iso
+                        live_intervals = stored_live_intervals
+                        _LOGGER.warning(
+                            "Glowmarkt returned fewer current-day %s intervals "
+                            "(%s < %s); preserving the last good cumulative state",
+                            classifier,
+                            candidate_count,
+                            stored_live_intervals,
+                        )
+                    elif candidate is not None:
+                        live_reading = candidate
+                        live_total = round(baseline + candidate.value, 3)
+                        live_day = candidate.day
+                        live_intervals = candidate_count
+                        self._last_readings[classifier] = candidate
+                    elif stored_live_day == today_iso and stored_live_intervals:
+                        live_total = stored_live_total
+                        live_day = today_iso
+                        live_intervals = stored_live_intervals
+                    else:
+                        cached = self._last_readings.get(classifier)
+                        if cached is not None and cached.day != today_iso:
+                            self._last_readings.pop(classifier, None)
+
+                cumulative[classifier] = {
+                    "day": completed_day.isoformat(),
+                    "completed_day": completed_day.isoformat(),
+                    "completed_cumulative": round(baseline, 3),
+                    "cumulative": round(live_total, 3),
+                    "live_day": live_day,
+                    "live_intervals": live_intervals,
+                }
+                result[classifier] = round(live_total, 3)
+                changed = True
+
+            if changed:
+                await self._store.async_save(cumulative)
+        return result
+
     def start_history_backfill(self) -> None:
         """Start backfill only after sensor entities exist; later polls can retry."""
-        if self._backfill_started:
+        if self._backfill_started or not self._entities_ready:
             return
         if not any(self._entity_id_for(c) for c in CUMULATIVE_CLASSIFIERS):
             return
         self._backfill_started = True
-        self.hass.async_create_task(
+        self._history_task = self.hass.async_create_task(
             self._async_backfill_history(),
             name=f"{DOMAIN} history backfill",
         )
@@ -217,19 +455,19 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self,
         delay: int = HISTORY_START_DELAY_SECONDS,
     ) -> None:
-        """Stagger history work so setup/entity registration can finish first."""
+        """Mark entities ready and stagger history work after setup."""
+        self._entities_ready = True
         if self._history_start_scheduled or self._backfill_started:
             return
         self._history_start_scheduled = True
-        self.hass.async_create_task(
+        self._delayed_history_task = self.hass.async_create_task(
             self._async_delayed_history_start(delay),
             name=f"{DOMAIN} delayed history start",
         )
 
     async def _async_backfill_history(self) -> None:
-        """Import all real hourly consumption history without blocking startup."""
+        """Import closed historical consumption; Recorder owns the open day."""
         completed = False
-        repair_legacy_current_day = False
         try:
             async with self._cumulative_lock:
                 cumulative = await self._load_cumulative()
@@ -240,97 +478,86 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ):
                     completed = True
                     return
-                repair_legacy_current_day = bool(cumulative.get("_backfilled"))
 
+            _LOGGER.info("Starting Glowmarkt completed consumption history backfill")
             history = await self.api_client.get_available_readings(
                 set(CUMULATIVE_CLASSIFIERS)
             )
 
+            entity_ids = [
+                entity_id
+                for classifier in CUMULATIVE_CLASSIFIERS
+                if (entity_id := self._entity_id_for(classifier)) is not None
+            ]
+            expected_entities = sum(
+                1 for classifier in CUMULATIVE_CLASSIFIERS if classifier in self._resources
+            )
+            if len(entity_ids) < expected_entities:
+                _LOGGER.debug("Consumption entities not registered; backfill will retry")
+                return
+
+            # v2.3 changes current-day ownership. Clear the old statistic series once
+            # so no v2.1/v2.2 synthetic/live rows can survive the migration.
+            await self._clear_statistics(entity_ids)
+
             async with self._cumulative_lock:
                 cumulative = await self._load_cumulative()
                 for classifier in CUMULATIVE_CLASSIFIERS:
+                    if classifier not in self._resources:
+                        continue
                     entity_id = self._entity_id_for(classifier)
                     if entity_id is None:
-                        _LOGGER.debug(
-                            "Entity not registered for %s; backfill will retry",
-                            classifier,
-                        )
                         return
 
                     baseline = 0.0
-                    entry = cumulative.get(
-                        classifier,
-                        {"day": None, "cumulative": 0.0},
-                    )
-                    for reading in history.get(classifier, []):
+                    last_day: str | None = None
+                    readings = history.get(classifier, [])
+                    imported_days = 0
+                    for reading in readings:
+                        if not self._reading_is_complete(reading):
+                            _LOGGER.warning(
+                                "Stopping %s history at incomplete PT30M day %s",
+                                classifier,
+                                reading.day,
+                            )
+                            break
                         baseline = self._import_hourly_statistics(
                             entity_id,
                             reading,
                             baseline,
                         )
-                        entry = {
-                            "day": reading.day,
-                            "cumulative": baseline,
-                        }
-                    cumulative[classifier] = entry
+                        last_day = reading.day
+                        imported_days += 1
 
-                    # v2.1.x wrote state=0 with the lifetime sum into today's hours.
-                    # On upgrade, overwrite those poisoned rows once with a state that
-                    # matches the live TOTAL_INCREASING entity. Fresh installs do not
-                    # write synthetic current-day statistics at all.
-                    if repair_legacy_current_day and entry.get("day") is not None:
-                        today_start_uk = datetime.now(UK_TZ).replace(
-                            hour=0,
-                            minute=0,
-                            second=0,
-                            microsecond=0,
-                        )
-                        today_start_utc = today_start_uk.astimezone(timezone.utc)
-                        current_hour_utc = datetime.now(timezone.utc).replace(
-                            minute=0,
-                            second=0,
-                            microsecond=0,
-                        )
-                        hours_elapsed = max(
-                            0,
-                            int(
-                                (current_hour_utc - today_start_utc).total_seconds()
-                                // 3600
-                            )
-                            + 1,
-                        )
-                        carry_forward = float(entry["cumulative"])
-                        repair_stats = [
-                            StatisticData(
-                                start=today_start_utc + timedelta(hours=hour),
-                                state=carry_forward,
-                                sum=carry_forward,
-                            )
-                            for hour in range(hours_elapsed)
-                        ]
-                        if repair_stats:
-                            async_import_statistics(
-                                self.hass,
-                                self._metadata_for(entity_id),
-                                repair_stats,
-                            )
+                    if last_day is not None:
+                        cumulative[classifier] = {
+                            "day": last_day,
+                            "completed_day": last_day,
+                            "completed_cumulative": round(baseline, 3),
+                            "cumulative": round(baseline, 3),
+                            "live_day": None,
+                            "live_intervals": 0,
+                        }
+                    _LOGGER.info(
+                        "Backfilled Glowmarkt completed consumption: %s=%s day(s)",
+                        classifier,
+                        imported_days,
+                    )
 
                 cumulative["_backfilled"] = True
                 cumulative["_backfilled_version"] = CUMULATIVE_BACKFILL_SCHEMA_VERSION
                 await self._store.async_save(cumulative)
                 completed = True
-                _LOGGER.info(
-                    "Backfilled Glowmarkt history: %s",
-                    ", ".join(
-                        f"{classifier}={len(readings)} day(s)"
-                        for classifier, readings in history.items()
-                    ),
-                )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             _LOGGER.exception("Glowmarkt history backfill failed")
         finally:
             if not completed:
                 self._backfill_started = False
+
+        if completed:
+            await self.async_request_refresh()
 
     def _cost_refresh_due(self, now: datetime) -> bool:
         if self._last_cost_refresh_at is None:
@@ -342,7 +569,9 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _refresh_cost_breakdowns(self, now: datetime) -> None:
         refreshed_any = False
-        for commodity, (_, cost_classifier) in COMMODITY_CLASSIFIERS.items():
+        for commodity, (_consumption_classifier, cost_classifier) in (
+            COMMODITY_CLASSIFIERS.items()
+        ):
             resource_id = self._resource_id_for(cost_classifier)
             if resource_id is None:
                 continue
@@ -366,12 +595,21 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_readings[cost_classifier] = DailyReading(
                 day=breakdown.day,
                 value=breakdown.total_pence,
-                intervals=[],
+                intervals=list(breakdown.usage_intervals),
             )
             refreshed_any = True
 
         if refreshed_any:
             self._last_cost_refresh_at = now
+            if self._entities_ready:
+                try:
+                    await async_sync_cost_ingestion(
+                        self.hass,
+                        self,
+                        self._site_id,
+                    )
+                except Exception:
+                    _LOGGER.exception("Glowmarkt rolling cost ingestion failed")
 
     def _configured_daily_cost(self, commodity: str, consumption: float) -> float:
         return round(
@@ -421,6 +659,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         else None
                     ),
                     "standing_charge_status": breakdown.standing_charge_status,
+                    "pt30m_intervals": len(breakdown.usage_intervals),
                 }
                 continue
 
@@ -444,6 +683,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "complete_day": True,
                     "usage_cost_gbp": None,
                     "standing_charge_status": "configured_fallback",
+                    "pt30m_intervals": None,
                 }
             else:
                 costs[commodity] = None
@@ -455,6 +695,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "complete_day": None,
                     "usage_cost_gbp": None,
                     "standing_charge_status": "unknown",
+                    "pt30m_intervals": None,
                 }
 
         available_totals = [
@@ -464,9 +705,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ]
         costs["total"] = round(sum(available_totals), 2) if available_totals else None
         costs["standing_charges_total"] = (
-            None
-            if standing_unknown
-            else round(sum(standing_values), 2)
+            None if standing_unknown else round(sum(standing_values), 2)
         )
         return costs, diagnostics
 
@@ -477,14 +716,9 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._virtual_entity_id
                 )
 
-            consumption_readings = await self.api_client.get_readings(
-                set(CUMULATIVE_CLASSIFIERS)
-            )
-            for classifier, reading in consumption_readings.items():
-                if reading is not None:
-                    self._last_readings[classifier] = reading
-
             now = datetime.now(timezone.utc)
+            cumulative_readings = await self._refresh_consumption(now.astimezone(UK_TZ))
+
             if self._cost_refresh_due(now):
                 await self._refresh_cost_breakdowns(now)
 
@@ -496,15 +730,6 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 classifier: reading.value if reading is not None else None
                 for classifier, reading in merged.items()
             }
-
-            cumulative_readings: dict[str, float | None] = {}
-            for classifier in CUMULATIVE_CLASSIFIERS:
-                reading = merged.get(classifier)
-                cumulative_readings[classifier] = (
-                    await self._accumulate(classifier, reading)
-                    if reading is not None
-                    else None
-                )
 
             costs, cost_diagnostics = self._compose_costs(values)
             data: dict[str, Any] = {
@@ -522,9 +747,29 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except GlowmarktApiError as err:
             raise UpdateFailed(f"API error: {err}") from err
 
+    async def async_shutdown(self) -> None:
+        """Cancel coordinator-owned history tasks before unload/reset."""
+        tasks = [
+            task
+            for task in (self._history_task, self._delayed_history_task)
+            if task is not None and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     @property
     def resources(self) -> dict[str, dict[str, Any]]:
         return self._resources
+
+    @property
+    def cost_breakdowns(self) -> dict[str, CostBreakdown]:
+        return self._cost_breakdowns
+
+    @property
+    def cost_history_lock(self) -> asyncio.Lock:
+        return self._cost_history_lock
 
     @property
     def consumption_interval_minutes(self) -> int:

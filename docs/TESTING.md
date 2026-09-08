@@ -13,7 +13,7 @@ Every pull request runs:
 - Hassfest;
 - HACS validation.
 
-The standard test suite covers API parsing, config flow, multi-site selection, sensor metadata, identity, coordinator behaviour, cumulative/restart safety, DST handling, history chunking, cost aggregation semantics, tariff ordering, backoff and failure behaviour.
+The standard test suite covers API parsing, config flow, multi-site selection, sensor metadata, identity, coordinator behaviour, cumulative/restart safety, DST handling, history chunking, rolling PT30M ingestion, cost aggregation semantics, tariff ordering, backoff and failure behaviour.
 
 Run locally with:
 
@@ -27,53 +27,104 @@ ruff check .
 
 A behavioural bug fix should include a regression test that describes the failure independently of the implementation.
 
-For historical energy and cost changes, tests should explicitly consider:
+For historical and rolling energy/cost changes, tests should explicitly consider:
 
 - missing/null readings;
 - genuine zero readings;
 - delayed DCC data;
-- repeated polling;
-- Home Assistant restart/reload;
-- out-of-order older data;
+- repeated polling with the same PT30M window;
+- a current-day window that grows by one or more intervals;
+- a transient current-day response that is shorter or empty;
+- same-count API revisions to existing intervals;
+- Home Assistant restart/reload during an open day;
+- one or more missed closed days after downtime;
+- incomplete closed days blocking later reconciliation;
 - UK-local midnight boundaries;
-- spring DST (46 PT30M intervals);
-- autumn DST (50 PT30M intervals);
+- ordinary days with 48 PT30M intervals;
+- spring DST with 46 PT30M intervals;
+- autumn DST with 50 PT30M intervals;
 - query end-boundary buckets;
+- current-day consumption being live-sensor-owned rather than manually imported;
 - PT30M cost being usage-only;
 - P1D cost containing standing charge;
-- completed-day residual `P1D - PT30M`;
+- closed-day P1D reconciliation happening before current-day cost publication;
+- provisional open-day cost being replaceable by completed-day P1D;
 - P1D not yet available (`daily_pending`);
 - negative/contradictory residuals returning `unknown` rather than a negative charge;
 - effective-dated tariff ordering;
 - 429/5xx responses;
 - transient connection drops;
-- interruption during background backfill.
+- interruption during background backfill;
+- unload/reset cancellation so an old worker cannot keep writing statistics.
+
+## Consumption statistics ownership
+
+Version 2.3 deliberately gives current and historical consumption different writers:
+
+- completed history is imported by the integration using cumulative `TOTAL_INCREASING` statistics;
+- the current UK-local day is **not** manually imported;
+- Recorder observes the live cumulative sensor as `completed baseline + today's published PT30M total`.
+
+Tests therefore verify that:
+
+- a repeated open-day poll is idempotent;
+- a restart reconstructs the same live cumulative value rather than adding the day twice;
+- a shorter/no open-day response never moves the cumulative sensor backwards;
+- a same-count revision is accepted;
+- a completed gap is reconciled before the current day is exposed;
+- an incomplete closed day holds the previous good state;
+- migration to the 2.3 schema clears/rebuilds completed history without creating synthetic current-day Recorder rows.
+
+## Cost statistics ownership
+
+The dedicated Energy-dashboard cost statistic is integration-owned.
+
+Tests verify the two-stage lifecycle:
+
+1. while a day is open, available PT30M usage-cost intervals can be published provisionally;
+2. once P1D appears, that day is reconciled to the authoritative completed total before a new open day is published.
+
+The cost-history store records an explicit `last_completed_day`; the latest external Recorder row must never be treated as proof that a day is complete because the current day can also contain provisional rows.
 
 ## Cost-component statistics
 
-Historical cost-component tests verify that:
+Usage Cost and Standing Charge are separate monetary `TOTAL` sensors.
 
-- usage cost and standing charge are imported as separate GBP statistics;
-- the daily `state` is the amount for that component on that UK-local day;
-- the `sum` is cumulative for Recorder compatibility;
-- DST-local midnights are converted to the correct UTC statistics timestamp;
+Historical component tests verify that:
+
+- usage and standing-charge values reconcile to the authoritative P1D total for each completed day;
+- their imported statistics follow the same hourly/daily-reset state semantics as the live sensors, rather than mixing a single daily historical state with hourly live states;
+- the running statistic `sum` remains cumulative for Recorder compatibility;
+- UK-local timestamps, including DST boundaries, map to the correct UTC statistic starts;
 - an unknown standing-charge split does not invent a historical value.
 
-These statistics are designed for Home Assistant's native Statistics Graph card with `chart_type: bar-stack` and one `state` series per component.
+These statistics are designed for Home Assistant's native Statistics Graph card with `chart_type: bar-stack` and `stat_types: state`.
 
 ## Tariff ledger
 
-`tariff-list` is treated as an effective-dated ledger. Tests cover stable ordering by `effectiveDate` / `from` and ensure tariff records remain separate from API-derived billing costs.
+`tariff-list` is treated as an effective-dated ledger. Tests cover stable ordering by `effectiveDate` / `from`, effective-period standing-charge normalisation and the rule that tariff data explains the component split without replacing API-derived P1D billing totals.
 
-The raw tariff values are not used to recalculate historical cost in tests. The cost resource remains authoritative.
+The configured current tariff is a calibration/fallback anchor, not a mechanism for recalculating old bills.
+
+## Reset contract
+
+`Reset imported history` is intentionally narrow. Tests verify that reset targets only:
+
+- this config entry's Hildebrand sensor statistics;
+- this site's dedicated external Energy cost statistics;
+- the integration's cumulative, cost-history and tariff-history stores.
+
+It must not delete credentials, entity registry entries, dashboards or unrelated Recorder statistics.
+
+After reset, the normal setup/ingestion path rebuilds history. There is no separate reset-only ingestion algorithm.
 
 ## Real-data oracle
 
 A privacy-safe oracle is derived from a contributed real Bright electricity export.
 
-The repository stores summary/fingerprint data only, not the raw household CSV. The oracle includes useful structural facts such as row counts, date boundaries, totals and SHA-256 fingerprints for selected historic slices.
+The repository stores summary/fingerprint data only, not the raw household CSV. The oracle includes useful structural facts such as row counts, date boundaries and selected timestamp fingerprints.
 
-Those totals/fingerprints describe the export **at the time it was taken**. They are useful diagnostic evidence, but they are not assumed to be an immutable billing ledger: Glowmarkt can revise historic values later.
+Historical totals/fingerprints describe the export **at the time it was taken**. They are useful diagnostic evidence, but they are not assumed to be an immutable billing ledger: Glowmarkt can revise historic values later.
 
 The raw household data must not be committed to this public repository.
 
@@ -135,6 +186,8 @@ Run it manually when a change affects:
 - resource discovery;
 - readings query parameters;
 - first/last history discovery;
+- rolling current-day PT30M retrieval;
+- completed-day reconciliation;
 - cost aggregation periods;
 - standing-charge reconciliation;
 - tariff-list retrieval;
@@ -148,8 +201,9 @@ Do not trigger it on every branch push. Normal CI is the default gate; the live 
 
 Before merging a release-affecting PR:
 
-1. Tests, Ruff, Hassfest and HACS must be green.
+1. Tests, Ruff, Hassfest and HACS must be green on the final head.
 2. Relevant regression tests must exist.
 3. If the API/history path changed, the protected live contract must pass.
 4. Documentation must match the shipped behaviour.
 5. The live workflow must remain manual-only.
+6. A clean reset/fresh-install acceptance should converge on the same history and rolling state as ordinary operation.

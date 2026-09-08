@@ -40,8 +40,15 @@
   "options": {
     "step": {
       "init": {
-        "title": "Hildebrand Glow Settings",
-        "description": "Change tariff values and API polling intervals. Polling below 5 minutes is blocked to protect the Glowmarkt API.",
+        "title": "Hildebrand Glow",
+        "menu_options": {
+          "settings": "Tariff and polling settings",
+          "reset_history": "Reset imported history"
+        }
+      },
+      "settings": {
+        "title": "Tariff and polling settings",
+        "description": "Change fallback tariff values and API polling intervals. Polling below 5 minutes is blocked to protect the Glowmarkt API.",
         "data": {
           "electricity_rate": "Electricity Rate (£/kWh)",
           "electricity_standing_charge": "Electricity Standing Charge (£/day)",
@@ -50,7 +57,18 @@
           "consumption_interval_minutes": "Consumption refresh interval (minutes)",
           "api_cost_interval_minutes": "API cost refresh interval (minutes)"
         }
+      },
+      "reset_history": {
+        "title": "Reset imported history",
+        "description": "Clear Hildebrand Glow's imported statistics and local backfill/tariff cache for this meter site, then rebuild them from Glow. Your credentials, entities, dashboards and unrelated Home Assistant history are not removed. Use this when imported history needs to be rebuilt or repaired."
       }
+    },
+    "error": {
+      "reset_failed": "The Hildebrand history reset failed. Your existing configuration has been preserved.",
+      "reload_failed": "History was reset, but the integration could not be loaded again. Check the logs and reload the integration from Settings."
+    },
+    "abort": {
+      "reset_complete": "Reset complete. {count} Hildebrand statistic IDs were cleared and the integration has restarted a clean backfill."
     }
   }
 }
