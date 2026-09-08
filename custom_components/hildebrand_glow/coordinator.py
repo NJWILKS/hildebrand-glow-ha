@@ -18,7 +18,13 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import DailyReading, GlowmarktApiClient, GlowmarktApiError, GlowmarktAuthError, UK_TZ
+from .api import (
+    DailyReading,
+    GlowmarktApiClient,
+    GlowmarktApiError,
+    GlowmarktAuthError,
+    UK_TZ,
+)
 from .const import (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_ELECTRICITY_COST,
@@ -199,7 +205,11 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @classmethod
     def _reading_is_complete(cls, reading: DailyReading) -> bool:
         day = date.fromisoformat(reading.day)
-        timestamps = {timestamp for timestamp, _value in reading.intervals}
+        timestamps = {
+            timestamp
+            for timestamp, _value in reading.intervals
+            if timestamp.astimezone(UK_TZ).date() == day
+        }
         return len(timestamps) == cls._expected_intervals(day)
 
     async def _current_day_reading(
@@ -291,6 +301,7 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             changed = False
             today = now_uk.date()
+            today_iso = today.isoformat()
             yesterday = today - timedelta(days=1)
 
             for classifier in CUMULATIVE_CLASSIFIERS:
@@ -314,6 +325,9 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         entry.get("cumulative", 0.0),
                     )
                 )
+                stored_live_day = entry.get("live_day")
+                stored_live_intervals = int(entry.get("live_intervals", 0) or 0)
+                stored_live_total = float(entry.get("cumulative", baseline))
                 entity_id = self._entity_id_for(classifier)
                 resource_id = self._resource_id_for(classifier)
                 if entity_id is None or resource_id is None:
@@ -356,15 +370,51 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
 
                 live_total = baseline
+                live_day: str | None = None
+                live_intervals = 0
                 live_reading: DailyReading | None = None
-                if not gap_blocked and completed_day == yesterday:
-                    live_reading = await self._current_day_reading(classifier, now_uk)
-                    if live_reading is not None:
-                        live_total = round(baseline + live_reading.value, 3)
-                        self._last_readings[classifier] = live_reading
+
+                if gap_blocked:
+                    # Do not let a late/incomplete closed day roll the TOTAL_INCREASING
+                    # sensor backwards. Hold the last good state until reconciliation.
+                    live_total = stored_live_total
+                    live_day = (
+                        str(stored_live_day) if stored_live_day is not None else None
+                    )
+                    live_intervals = stored_live_intervals
+                elif completed_day == yesterday:
+                    candidate = await self._current_day_reading(classifier, now_uk)
+                    candidate_count = len(candidate.intervals) if candidate else 0
+
+                    if (
+                        stored_live_day == today_iso
+                        and stored_live_intervals > candidate_count
+                    ):
+                        # Bright can transiently return a shorter partial-day window.
+                        # Replaying it would look like a meter reset to Recorder.
+                        live_total = stored_live_total
+                        live_day = today_iso
+                        live_intervals = stored_live_intervals
+                        _LOGGER.warning(
+                            "Glowmarkt returned fewer current-day %s intervals "
+                            "(%s < %s); preserving the last good cumulative state",
+                            classifier,
+                            candidate_count,
+                            stored_live_intervals,
+                        )
+                    elif candidate is not None:
+                        live_reading = candidate
+                        live_total = round(baseline + candidate.value, 3)
+                        live_day = candidate.day
+                        live_intervals = candidate_count
+                        self._last_readings[classifier] = candidate
+                    elif stored_live_day == today_iso and stored_live_intervals:
+                        live_total = stored_live_total
+                        live_day = today_iso
+                        live_intervals = stored_live_intervals
                     else:
                         cached = self._last_readings.get(classifier)
-                        if cached is not None and cached.day != today.isoformat():
+                        if cached is not None and cached.day != today_iso:
                             self._last_readings.pop(classifier, None)
 
                 cumulative[classifier] = {
@@ -372,12 +422,8 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "completed_day": completed_day.isoformat(),
                     "completed_cumulative": round(baseline, 3),
                     "cumulative": round(live_total, 3),
-                    "live_day": (
-                        live_reading.day if live_reading is not None else None
-                    ),
-                    "live_intervals": (
-                        len(live_reading.intervals) if live_reading is not None else 0
-                    ),
+                    "live_day": live_day,
+                    "live_intervals": live_intervals,
                 }
                 result[classifier] = round(live_total, 3)
                 changed = True
@@ -466,13 +512,22 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     baseline = 0.0
                     last_day: str | None = None
                     readings = history.get(classifier, [])
+                    imported_days = 0
                     for reading in readings:
+                        if not self._reading_is_complete(reading):
+                            _LOGGER.warning(
+                                "Stopping %s history at incomplete PT30M day %s",
+                                classifier,
+                                reading.day,
+                            )
+                            break
                         baseline = self._import_hourly_statistics(
                             entity_id,
                             reading,
                             baseline,
                         )
                         last_day = reading.day
+                        imported_days += 1
 
                     if last_day is not None:
                         cumulative[classifier] = {
@@ -483,18 +538,16 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             "live_day": None,
                             "live_intervals": 0,
                         }
+                    _LOGGER.info(
+                        "Backfilled Glowmarkt completed consumption: %s=%s day(s)",
+                        classifier,
+                        imported_days,
+                    )
 
                 cumulative["_backfilled"] = True
                 cumulative["_backfilled_version"] = CUMULATIVE_BACKFILL_SCHEMA_VERSION
                 await self._store.async_save(cumulative)
                 completed = True
-                _LOGGER.info(
-                    "Backfilled Glowmarkt completed consumption history: %s",
-                    ", ".join(
-                        f"{classifier}={len(readings)} day(s)"
-                        for classifier, readings in history.items()
-                    ),
-                )
         except asyncio.CancelledError:
             raise
         except Exception:
