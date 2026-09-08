@@ -165,6 +165,9 @@ def _seed_ready_consumption(
         }
     )
     coordinator._entity_id_for = lambda classifier: f"sensor.{classifier.replace('.', '_')}"
+    coordinator._add_consumption_statistics = (
+        lambda _classifier, reading, baseline: round(baseline + reading.value, 3)
+    )
 
 
 @pytest.mark.asyncio
