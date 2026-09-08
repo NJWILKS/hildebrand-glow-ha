@@ -107,14 +107,23 @@ def _tariff_values(item: dict[str, Any]) -> tuple[float | None, float | None, st
 
     rate_values = _unique_numbers(found["rate"] + found["tourate"])
     has_dynamic = any(value not in (None, "", False) for value in found["dynamic"])
-    has_tou_structure = len(rate_values) > 1 or bool(found["time"] or found["tier"])
+    has_time_windows = any(value not in (None, "", False) for value in found["time"])
+    has_tou_rates = any(value not in (None, "", False) for value in found["tourate"])
+    has_tiers = any(value not in (None, "", False) for value in found["tier"])
 
     if has_dynamic:
         return standing, None, "dynamic"
-    if has_tou_structure:
+
+    # Glow's documented flat-rate shape may put ``tier: 1`` alongside the sole
+    # unit rate. A tier marker by itself therefore does not make a tariff TOU.
+    # Time windows / explicit TOU rates are the discriminators for TOU, while
+    # multiple tiered rates without time windows represent a block tariff.
+    if has_time_windows or has_tou_rates:
         return standing, None, "tou"
     if len(rate_values) == 1:
         return standing, rate_values[0], "flat"
+    if len(rate_values) > 1 and has_tiers:
+        return standing, None, "block"
     return standing, None, "unknown"
 
 
