@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
 
 from custom_components.hildebrand_glow import coordinator as coordinator_module
 from custom_components.hildebrand_glow.api import UK_TZ, DailyReading
-from custom_components.hildebrand_glow.const import (
-    CLASSIFIER_ELECTRICITY_CONSUMPTION,
-    CLASSIFIER_GAS_CONSUMPTION,
-)
+from custom_components.hildebrand_glow.const import CLASSIFIER_ELECTRICITY_CONSUMPTION
 from custom_components.hildebrand_glow.coordinator import (
     CUMULATIVE_BACKFILL_SCHEMA_VERSION,
     GlowmarktDataUpdateCoordinator,
+)
+from custom_components.hildebrand_glow.consumption_statistics import (
+    energy_consumption_statistic_id,
 )
 
 
@@ -39,67 +39,37 @@ def _coordinator(hass, api) -> GlowmarktDataUpdateCoordinator:
             "gas_rate": 0.07,
             "gas_standing_charge": 0.30,
         },
+        virtual_entity_id="site-123",
     )
 
 
-def test_imported_total_increasing_state_matches_cumulative_sum(hass, monkeypatch) -> None:
-    captured = []
-
-    def capture_statistics(_hass, _metadata, stats) -> None:
-        captured.extend(stats)
-
-    monkeypatch.setattr(
-        coordinator_module,
-        "async_import_statistics",
-        capture_statistics,
-    )
-    coordinator = _coordinator(hass, object())
-    start = datetime(2026, 9, 5, 0, 0, tzinfo=timezone.utc)
-    reading = DailyReading(
-        day="2026-09-05",
-        value=4.0,
+def _complete(day: str, value: float) -> DailyReading:
+    start = datetime.fromisoformat(day).replace(tzinfo=UK_TZ)
+    values = [value / 48.0] * 48
+    return DailyReading(
+        day=day,
+        value=value,
         intervals=[
-            (start, 1.0),
-            (start + timedelta(minutes=30), 0.5),
-            (start + timedelta(hours=1), 2.5),
+            (start + timedelta(minutes=30 * index), interval)
+            for index, interval in enumerate(values)
         ],
     )
-
-    ending = coordinator._import_hourly_statistics(
-        "sensor.smart_meter_electricity_consumption",
-        reading,
-        100.0,
-    )
-
-    assert ending == 104.0
-    assert [item["state"] for item in captured] == [101.5, 104.0]
-    assert [item["sum"] for item in captured] == [101.5, 104.0]
 
 
 @pytest.mark.asyncio
-async def test_v23_migration_rebuilds_closed_history_without_synthetic_open_day(
+async def test_schema_upgrade_clears_legacy_and_external_stats_then_migrates_energy(
     hass,
+    freezer,
     monkeypatch,
 ) -> None:
-    history_start = datetime(2026, 9, 5, 0, 0, tzinfo=UK_TZ)
-    interval_value = 2.0 / 48
-    electricity = DailyReading(
-        day="2026-09-05",
-        value=2.0,
-        intervals=[
-            (history_start + timedelta(minutes=30 * index), interval_value)
-            for index in range(48)
-        ],
-    )
+    freezer.move_to("2026-09-08 12:00:00+01:00")
+    reading = _complete("2026-09-05", 2.0)
     api = type(
         "FakeApi",
         (),
         {
             "get_available_readings": AsyncMock(
-                return_value={
-                    CLASSIFIER_ELECTRICITY_CONSUMPTION: [electricity],
-                    CLASSIFIER_GAS_CONSUMPTION: [],
-                }
+                return_value={CLASSIFIER_ELECTRICITY_CONSUMPTION: [reading]}
             )
         },
     )()
@@ -111,146 +81,67 @@ async def test_v23_migration_rebuilds_closed_history_without_synthetic_open_day(
         {
             "_backfilled": True,
             "_backfilled_version": CUMULATIVE_BACKFILL_SCHEMA_VERSION - 1,
-            CLASSIFIER_ELECTRICITY_CONSUMPTION: {
-                "day": "2026-09-05",
-                "cumulative": 2.0,
-            },
         }
     )
-    coordinator._entity_id_for = lambda classifier: f"sensor.{classifier.replace('.', '_')}"
+    coordinator._entity_id_for = lambda _classifier: "sensor.legacy_electricity"
     coordinator._clear_statistics = AsyncMock()
     coordinator.async_request_refresh = AsyncMock()
 
-    imported: list[tuple[str, list]] = []
+    imported: list[tuple[str, str, float]] = []
 
-    def capture_statistics(_hass, metadata, stats) -> None:
-        imported.append((metadata["statistic_id"], list(stats)))
+    def capture(_hass, site_id, commodity, readings, *, baseline=0.0):
+        ending = baseline + sum(item.value for item in readings)
+        imported.append((site_id, commodity, ending))
+        return [], ending
 
+    monkeypatch.setattr(coordinator_module, "add_consumption_statistics", capture)
+    migrate = AsyncMock(return_value=True)
     monkeypatch.setattr(
         coordinator_module,
-        "async_import_statistics",
-        capture_statistics,
+        "async_migrate_energy_consumption_statistics",
+        migrate,
     )
 
     await coordinator._async_backfill_history()
 
-    electricity_imports = [
-        stats
-        for statistic_id, stats in imported
-        if statistic_id == "sensor.electricity_consumption"
-    ]
-    assert len(electricity_imports) == 1
-    rebuilt = electricity_imports[0]
-    assert rebuilt
-    assert all(
-        item["start"].astimezone(UK_TZ).date().isoformat() == "2026-09-05"
-        for item in rebuilt
+    external_id = energy_consumption_statistic_id("site-123", "electricity")
+    coordinator._clear_statistics.assert_awaited_once_with(
+        ["sensor.legacy_electricity", external_id]
     )
-    assert coordinator._store.state[CLASSIFIER_ELECTRICITY_CONSUMPTION] == {
-        "day": "2026-09-05",
-        "completed_day": "2026-09-05",
-        "completed_cumulative": 2.0,
-        "cumulative": 2.0,
-        "live_day": None,
-        "live_intervals": 0,
-    }
+    assert imported == [("site-123", "electricity", 2.0)]
+    migrate.assert_awaited_once_with(
+        hass,
+        {"sensor.legacy_electricity": external_id},
+    )
+    assert coordinator._store.state[CLASSIFIER_ELECTRICITY_CONSUMPTION][
+        "completed_cumulative"
+    ] == 2.0
     assert coordinator._store.state["_backfilled_version"] == (
         CUMULATIVE_BACKFILL_SCHEMA_VERSION
     )
-    coordinator._clear_statistics.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_v231_backfill_keeps_partial_old_history_and_continues(
+async def test_backfill_keeps_partial_old_history_but_defers_incomplete_yesterday(
     hass,
     freezer,
     monkeypatch,
 ) -> None:
     freezer.move_to("2026-09-08 12:00:00+01:00")
-    first_start = datetime(2025, 7, 30, 10, 0, tzinfo=UK_TZ)
-    first = DailyReading(
+    old_start = datetime(2025, 7, 30, 10, 0, tzinfo=UK_TZ)
+    old_partial = DailyReading(
         day="2025-07-30",
         value=1.0,
-        intervals=[
-            (first_start, 0.4),
-            (first_start + timedelta(minutes=30), 0.6),
-        ],
+        intervals=[(old_start, 0.4), (old_start + timedelta(minutes=30), 0.6)],
     )
-    second_start = datetime(2025, 7, 31, 0, 0, tzinfo=UK_TZ)
-    second = DailyReading(
-        day="2025-07-31",
-        value=4.8,
-        intervals=[
-            (second_start + timedelta(minutes=30 * index), 0.1)
-            for index in range(48)
-        ],
-    )
-    api = type(
-        "FakeApi",
-        (),
-        {
-            "get_available_readings": AsyncMock(
-                return_value={
-                    CLASSIFIER_ELECTRICITY_CONSUMPTION: [first, second],
-                    CLASSIFIER_GAS_CONSUMPTION: [],
-                }
-            )
-        },
-    )()
-    coordinator = _coordinator(hass, api)
-    coordinator._resources = {
-        CLASSIFIER_ELECTRICITY_CONSUMPTION: {"resource_id": "electricity-resource"}
-    }
-    coordinator._store = FakeStore()
-    coordinator._entity_id_for = lambda classifier: f"sensor.{classifier.replace('.', '_')}"
-    coordinator._clear_statistics = AsyncMock()
-    coordinator.async_request_refresh = AsyncMock()
-
-    imported: list[tuple[str, list]] = []
-
-    def capture_statistics(_hass, metadata, stats) -> None:
-        imported.append((metadata["statistic_id"], list(stats)))
-
-    monkeypatch.setattr(coordinator_module, "async_import_statistics", capture_statistics)
-
-    await coordinator._async_backfill_history()
-
-    dates = [
-        stat["start"].astimezone(UK_TZ).date().isoformat()
-        for _statistic_id, stats in imported
-        for stat in stats
-    ]
-    assert "2025-07-30" in dates
-    assert "2025-07-31" in dates
-    state = coordinator._store.state[CLASSIFIER_ELECTRICITY_CONSUMPTION]
-    assert state["completed_day"] == "2025-07-31"
-    assert state["completed_cumulative"] == 5.8
-    assert coordinator._store.state["_backfilled"] is True
-
-
-@pytest.mark.asyncio
-async def test_v231_backfill_defers_incomplete_yesterday(
-    hass,
-    freezer,
-    monkeypatch,
-) -> None:
-    freezer.move_to("2026-09-08 12:00:00+01:00")
-    complete_start = datetime(2026, 9, 6, 0, 0, tzinfo=UK_TZ)
-    complete = DailyReading(
-        day="2026-09-06",
-        value=4.8,
-        intervals=[
-            (complete_start + timedelta(minutes=30 * index), 0.1)
-            for index in range(48)
-        ],
-    )
-    partial_start = datetime(2026, 9, 7, 0, 0, tzinfo=UK_TZ)
-    partial = DailyReading(
+    complete = _complete("2026-09-06", 4.8)
+    trailing_start = datetime(2026, 9, 7, 0, 0, tzinfo=UK_TZ)
+    trailing = DailyReading(
         day="2026-09-07",
         value=0.2,
         intervals=[
-            (partial_start, 0.1),
-            (partial_start + timedelta(minutes=30), 0.1),
+            (trailing_start, 0.1),
+            (trailing_start + timedelta(minutes=30), 0.1),
         ],
     )
     api = type(
@@ -259,8 +150,11 @@ async def test_v231_backfill_defers_incomplete_yesterday(
         {
             "get_available_readings": AsyncMock(
                 return_value={
-                    CLASSIFIER_ELECTRICITY_CONSUMPTION: [complete, partial],
-                    CLASSIFIER_GAS_CONSUMPTION: [],
+                    CLASSIFIER_ELECTRICITY_CONSUMPTION: [
+                        old_partial,
+                        complete,
+                        trailing,
+                    ]
                 }
             )
         },
@@ -270,33 +164,38 @@ async def test_v231_backfill_defers_incomplete_yesterday(
         CLASSIFIER_ELECTRICITY_CONSUMPTION: {"resource_id": "electricity-resource"}
     }
     coordinator._store = FakeStore()
-    coordinator._entity_id_for = lambda classifier: f"sensor.{classifier.replace('.', '_')}"
+    coordinator._entity_id_for = lambda _classifier: "sensor.legacy_electricity"
     coordinator._clear_statistics = AsyncMock()
     coordinator.async_request_refresh = AsyncMock()
 
-    imported: list[tuple[str, list]] = []
+    imported_days: list[str] = []
 
-    def capture_statistics(_hass, metadata, stats) -> None:
-        imported.append((metadata["statistic_id"], list(stats)))
+    def capture(_hass, _site_id, _commodity, readings, *, baseline=0.0):
+        imported_days.extend(item.day for item in readings)
+        ending = baseline + sum(item.value for item in readings)
+        return [], ending
 
-    monkeypatch.setattr(coordinator_module, "async_import_statistics", capture_statistics)
+    monkeypatch.setattr(coordinator_module, "add_consumption_statistics", capture)
+    monkeypatch.setattr(
+        coordinator_module,
+        "async_migrate_energy_consumption_statistics",
+        AsyncMock(return_value=True),
+    )
 
     await coordinator._async_backfill_history()
 
-    dates = {
-        stat["start"].astimezone(UK_TZ).date().isoformat()
-        for _statistic_id, stats in imported
-        for stat in stats
-    }
-    assert dates == {"2026-09-06"}
+    assert imported_days == ["2025-07-30", "2026-09-06"]
     state = coordinator._store.state[CLASSIFIER_ELECTRICITY_CONSUMPTION]
     assert state["completed_day"] == "2026-09-06"
-    assert state["completed_cumulative"] == 4.8
+    assert state["completed_cumulative"] == 5.8
 
 
 def test_history_backfill_uses_background_task(hass, monkeypatch) -> None:
     coordinator = _coordinator(hass, object())
     coordinator._entities_ready = True
+    coordinator._resources = {
+        CLASSIFIER_ELECTRICITY_CONSUMPTION: {"resource_id": "electricity-resource"}
+    }
     coordinator._entity_id_for = lambda _classifier: "sensor.electricity_consumption"
     coordinator._async_backfill_history = AsyncMock()
 
