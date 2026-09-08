@@ -32,22 +32,22 @@ from .identity import sensor_unique_id, site_identity
 
 SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
     CLASSIFIER_ELECTRICITY_CONSUMPTION: {
-        "name": "Electricity Consumption",
+        "name": "Electricity Consumption Today",
         "icon": "mdi:flash",
         "device_class": SensorDeviceClass.ENERGY,
-        # Historical and open-day Energy statistics are integration-owned external
-        # rows. Deliberately omit a state class so Recorder cannot compile a second,
-        # competing long-term sum from this presentation sensor.
+        # The visible sensor is a useful daily value. Historical/open-day Energy
+        # statistics are integration-owned external rows, so Recorder must not
+        # compile a second lifetime TOTAL_INCREASING series from this entity.
         "native_unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
-        "data_key": "cumulative_readings",
+        "data_key": "readings",
         "reading_key": CLASSIFIER_ELECTRICITY_CONSUMPTION,
     },
     CLASSIFIER_GAS_CONSUMPTION: {
-        "name": "Gas Consumption",
+        "name": "Gas Consumption Today",
         "icon": "mdi:fire",
         "device_class": SensorDeviceClass.ENERGY,
         "native_unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
-        "data_key": "cumulative_readings",
+        "data_key": "readings",
         "reading_key": CLASSIFIER_GAS_CONSUMPTION,
     },
     f"{CLASSIFIER_ELECTRICITY_COST}_api": {
@@ -87,7 +87,8 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Electricity Usage Cost",
         "icon": "mdi:flash-outline",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
+        # Historical and current-day statistics for the stacked cost chart are
+        # imported by the integration. No state class means there is one writer.
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "electricity_usage",
@@ -98,7 +99,6 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Electricity Standing Charge",
         "icon": "mdi:cash-clock",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "electricity_standing_charge",
@@ -120,7 +120,6 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Gas Usage Cost",
         "icon": "mdi:fire",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "gas_usage",
@@ -131,7 +130,6 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Gas Standing Charge",
         "icon": "mdi:cash-clock",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "gas_standing_charge",
