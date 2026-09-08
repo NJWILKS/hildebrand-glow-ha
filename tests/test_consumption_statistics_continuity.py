@@ -9,12 +9,12 @@ import pytest
 from custom_components.hildebrand_glow import coordinator as coordinator_module
 from custom_components.hildebrand_glow.api import UK_TZ, DailyReading
 from custom_components.hildebrand_glow.const import CLASSIFIER_ELECTRICITY_CONSUMPTION
+from custom_components.hildebrand_glow.consumption_statistics import (
+    energy_consumption_statistic_id,
+)
 from custom_components.hildebrand_glow.coordinator import (
     CUMULATIVE_BACKFILL_SCHEMA_VERSION,
     GlowmarktDataUpdateCoordinator,
-)
-from custom_components.hildebrand_glow.consumption_statistics import (
-    energy_consumption_statistic_id,
 )
 
 
