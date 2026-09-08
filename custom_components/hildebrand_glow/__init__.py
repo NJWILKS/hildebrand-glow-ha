@@ -24,6 +24,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import GlowmarktDataUpdateCoordinator
+from .energy_migration import async_migrate_energy_consumption_statistics
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
@@ -84,6 +85,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN][entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # 2.3.4 migrated Energy consumption to an external statistic but did not
+    # attach the integration-owned external cost statistic to the same Energy
+    # source. Re-run the preference repair on every setup so existing installs
+    # pick up cost history without requiring the source to be removed/re-added.
+    await async_migrate_energy_consumption_statistics(hass, {})
+
     coordinator.schedule_history_backfill()
     entry.async_on_unload(entry.add_update_listener(async_update_options))
     return True
