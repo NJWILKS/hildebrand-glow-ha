@@ -35,7 +35,9 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Electricity Consumption",
         "icon": "mdi:flash",
         "device_class": SensorDeviceClass.ENERGY,
-        "state_class": SensorStateClass.TOTAL_INCREASING,
+        # Historical and open-day Energy statistics are integration-owned external
+        # rows. Deliberately omit a state class so Recorder cannot compile a second,
+        # competing long-term sum from this presentation sensor.
         "native_unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
         "data_key": "cumulative_readings",
         "reading_key": CLASSIFIER_ELECTRICITY_CONSUMPTION,
@@ -44,7 +46,6 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Gas Consumption",
         "icon": "mdi:fire",
         "device_class": SensorDeviceClass.ENERGY,
-        "state_class": SensorStateClass.TOTAL_INCREASING,
         "native_unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
         "data_key": "cumulative_readings",
         "reading_key": CLASSIFIER_GAS_CONSUMPTION,
@@ -163,7 +164,7 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Create entities from the coordinator's already-discovered resources."""
+    """Create entities and own the single cost-ingestion worker for this entry."""
     coordinator: GlowmarktDataUpdateCoordinator = hass.data[DOMAIN][
         config_entry.entry_id
     ]
@@ -182,11 +183,16 @@ async def async_setup_entry(
         for sensor_key, description in SENSOR_DESCRIPTIONS.items()
     ]
     async_add_entities(entities)
-    config_entry.async_create_background_task(
-        hass,
-        async_cost_ingestion_worker(hass, coordinator, site_id),
-        f"{DOMAIN} cost ingestion worker",
-    )
+
+    if any(
+        classifier in coordinator.resources
+        for classifier in (CLASSIFIER_ELECTRICITY_COST, CLASSIFIER_GAS_COST)
+    ):
+        config_entry.async_create_background_task(
+            hass,
+            async_cost_ingestion_worker(hass, coordinator, site_id),
+            f"{DOMAIN} cost ingestion worker",
+        )
 
 
 class GlowmarktSensor(
