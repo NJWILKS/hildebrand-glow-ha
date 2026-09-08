@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from custom_components.hildebrand_glow import coordinator as coordinator_module
-from custom_components.hildebrand_glow.api import DailyReading, UK_TZ
+from custom_components.hildebrand_glow.api import UK_TZ, DailyReading
 from custom_components.hildebrand_glow.const import CLASSIFIER_ELECTRICITY_CONSUMPTION
 from custom_components.hildebrand_glow.coordinator import (
     CUMULATIVE_BACKFILL_SCHEMA_VERSION,
