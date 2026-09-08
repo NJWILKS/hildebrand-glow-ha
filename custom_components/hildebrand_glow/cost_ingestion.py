@@ -3,36 +3,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     async_import_statistics,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
 
-from .api import UK_TZ
-from .cost_history import (
-    COMPONENT_KEYS,
-    COST_BACKFILL_SCHEMA_VERSION,
-    COST_HISTORY_REFRESH_SECONDS,
-    COST_HISTORY_STORAGE_VERSION,
-    INITIAL_DELAY_SECONDS,
-    TARIFF_HISTORY_STORAGE_VERSION,
-    TARIFF_REFRESH_SECONDS,
-    _clear_statistics,
-    _external_cost_metadata,
-    _load_tariff_ledger,
-    _metadata,
-    _refresh_tariff_ledger,
-    _save_tariff_analysis,
-    build_component_statistics,
-    build_total_cost_statistics,
-    energy_cost_statistic_id,
+from .api import GlowmarktApiError, UK_TZ
+from .const import (
+    CLASSIFIER_ELECTRICITY_COST,
+    CLASSIFIER_GAS_COST,
+    DOMAIN,
+    GLOWMARKT_API_BASE,
 )
 from .costing import CostBreakdown, get_cost_history
+from .identity import sensor_unique_id
 from .tariff import derive_tariff_periods, normalise_cost_history, tariff_period_as_dict
 
 if TYPE_CHECKING:
@@ -40,10 +37,266 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# v2.3 makes the completed/open-day boundary explicit. The old v2.1/v2.2
-# cost store inferred completion from Recorder's last external row, which is not
-# valid once the current day is also imported provisionally.
+COST_HISTORY_STORAGE_VERSION = 1
+TARIFF_HISTORY_STORAGE_VERSION = 1
+COST_BACKFILL_SCHEMA_VERSION = 6
 COST_INGESTION_SCHEMA_VERSION = 1
+INITIAL_DELAY_SECONDS = 30
+COST_HISTORY_REFRESH_SECONDS = 6 * 60 * 60
+TARIFF_REFRESH_SECONDS = 24 * 60 * 60
+STAT_PRECISION = 6
+
+COMPONENT_KEYS = {
+    "electricity": (
+        CLASSIFIER_ELECTRICITY_COST,
+        "electricity_daily_cost",
+        "electricity_usage_cost",
+        "electricity_standing_charge",
+    ),
+    "gas": (
+        CLASSIFIER_GAS_COST,
+        "gas_daily_cost",
+        "gas_usage_cost",
+        "gas_standing_charge",
+    ),
+}
+
+
+def _round_stat(value: float) -> float:
+    return round(float(value), STAT_PRECISION)
+
+
+def _gbp_from_pence(value: float) -> float:
+    return _round_stat(float(value) / 100.0)
+
+
+def _metadata(entity_id: str) -> StatisticMetaData:
+    return StatisticMetaData(
+        has_sum=True,
+        mean_type=StatisticMeanType.NONE,
+        name=None,
+        source="recorder",
+        statistic_id=entity_id,
+        unit_class=None,
+        unit_of_measurement="GBP",
+    )
+
+
+def energy_cost_statistic_id(site_id: str, commodity: str) -> str:
+    """Return the stable external Energy cost statistic ID."""
+    safe_site = re.sub(r"[^a-z0-9_]+", "_", site_id.lower()).strip("_")
+    safe_commodity = re.sub(r"[^a-z0-9_]+", "_", commodity.lower()).strip("_")
+    return f"{DOMAIN}:{safe_site}_{safe_commodity}_energy_cost"
+
+
+def _external_cost_metadata(site_id: str, commodity: str) -> StatisticMetaData:
+    return StatisticMetaData(
+        has_sum=True,
+        mean_type=StatisticMeanType.NONE,
+        name=f"Hildebrand Glow {commodity.title()} Energy Cost",
+        source=DOMAIN,
+        statistic_id=energy_cost_statistic_id(site_id, commodity),
+        unit_class=None,
+        unit_of_measurement="GBP",
+    )
+
+
+def _day_start_utc(day: str) -> datetime:
+    return (
+        datetime.fromisoformat(day)
+        .replace(tzinfo=UK_TZ)
+        .astimezone(timezone.utc)
+    )
+
+
+def build_total_cost_statistics(
+    history: list[CostBreakdown],
+    *,
+    baseline: float = 0.0,
+) -> list[StatisticData]:
+    """Build hourly Energy cost rows with a monotonic cumulative sum."""
+    running = _round_stat(baseline)
+    stats: list[StatisticData] = []
+
+    for breakdown in history:
+        total_gbp = _gbp_from_pence(breakdown.total_pence)
+        hourly_pence: dict[datetime, float] = {}
+        for timestamp, value_pence in breakdown.usage_intervals:
+            hour_start = timestamp.replace(minute=0, second=0, microsecond=0)
+            hourly_pence[hour_start] = (
+                hourly_pence.get(hour_start, 0.0) + float(value_pence)
+            )
+
+        if not hourly_pence:
+            running = _round_stat(running + total_gbp)
+            stats.append(
+                StatisticData(
+                    start=_day_start_utc(breakdown.day),
+                    state=total_gbp,
+                    sum=running,
+                )
+            )
+            continue
+
+        ordered_hours = sorted(hourly_pence)
+        residual_pence = float(breakdown.total_pence) - sum(hourly_pence.values())
+        if residual_pence:
+            hourly_pence[ordered_hours[0]] += residual_pence
+
+        day_states = [_gbp_from_pence(hourly_pence[hour]) for hour in ordered_hours]
+        correction = _round_stat(total_gbp - sum(day_states))
+        if correction:
+            day_states[-1] = _round_stat(day_states[-1] + correction)
+
+        for hour_start, state in zip(ordered_hours, day_states, strict=True):
+            running = _round_stat(running + state)
+            stats.append(
+                StatisticData(
+                    start=hour_start,
+                    state=state,
+                    sum=running,
+                )
+            )
+
+    return stats
+
+
+def build_component_statistics(
+    history: list[CostBreakdown],
+    *,
+    usage_baseline: float = 0.0,
+    standing_baseline: float = 0.0,
+) -> tuple[list[StatisticData], list[StatisticData]]:
+    """Build settled daily usage/standing component rows."""
+    usage_running = _round_stat(usage_baseline)
+    standing_running = _round_stat(standing_baseline)
+    usage_stats: list[StatisticData] = []
+    standing_stats: list[StatisticData] = []
+
+    for breakdown in history:
+        start = _day_start_utc(breakdown.day)
+        if breakdown.usage_pence is not None:
+            usage_gbp = _gbp_from_pence(breakdown.usage_pence)
+            usage_running = _round_stat(usage_running + usage_gbp)
+            usage_stats.append(
+                StatisticData(start=start, state=usage_gbp, sum=usage_running)
+            )
+        if breakdown.standing_charge_pence is not None:
+            standing_gbp = _gbp_from_pence(breakdown.standing_charge_pence)
+            standing_running = _round_stat(standing_running + standing_gbp)
+            standing_stats.append(
+                StatisticData(
+                    start=start,
+                    state=standing_gbp,
+                    sum=standing_running,
+                )
+            )
+    return usage_stats, standing_stats
+
+
+async def _clear_statistics(hass: HomeAssistant, statistic_ids: list[str]) -> None:
+    if not statistic_ids:
+        return
+    done = asyncio.Event()
+
+    def _done() -> None:
+        hass.loop.call_soon_threadsafe(done.set)
+
+    get_instance(hass).async_clear_statistics(statistic_ids, on_done=_done)
+    await done.wait()
+
+
+async def _entity_id(
+    hass: HomeAssistant,
+    site_id: str,
+    sensor_key: str,
+) -> str | None:
+    registry = er.async_get(hass)
+    return registry.async_get_entity_id(
+        "sensor",
+        DOMAIN,
+        sensor_unique_id(site_id, sensor_key, None),
+    )
+
+
+async def _load_store(hass: HomeAssistant, site_id: str) -> tuple[Store, dict[str, Any]]:
+    store = Store(
+        hass,
+        COST_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_cost_history",
+    )
+    return store, await store.async_load() or {}
+
+
+async def _load_tariff_ledger(hass: HomeAssistant, site_id: str) -> dict[str, Any]:
+    store = Store(
+        hass,
+        TARIFF_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_tariff_history",
+    )
+    return await store.async_load() or {}
+
+
+async def _save_tariff_analysis(
+    hass: HomeAssistant,
+    site_id: str,
+    analysis: dict[str, list[dict[str, Any]]],
+) -> None:
+    store = Store(
+        hass,
+        TARIFF_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_tariff_history",
+    )
+    state = await store.async_load() or {}
+    state["analysis"] = analysis
+    await store.async_save(state)
+
+
+def _effective_key(item: dict[str, Any]) -> str:
+    return str(
+        item.get("effectiveDate")
+        or item.get("from")
+        or item.get("effective")
+        or ""
+    )
+
+
+async def _refresh_tariff_ledger(
+    hass: HomeAssistant,
+    coordinator: GlowmarktDataUpdateCoordinator,
+    site_id: str,
+) -> dict[str, Any]:
+    ledger: dict[str, list[dict[str, Any]]] = {}
+    for commodity, (cost_classifier, _daily, _usage, _standing) in COMPONENT_KEYS.items():
+        resource = coordinator.resources.get(cost_classifier)
+        if not resource:
+            continue
+        data = await coordinator.api_client._get_json(  # noqa: SLF001
+            f"{GLOWMARKT_API_BASE}/resource/{resource['resource_id']}/tariff-list"
+        )
+        if not isinstance(data, dict) or data.get("status") not in (None, "OK"):
+            raise GlowmarktApiError("Glowmarkt tariff-list query returned an error")
+        raw = data.get("data") or []
+        if isinstance(raw, list):
+            ledger[commodity] = sorted(
+                [item for item in raw if isinstance(item, dict)],
+                key=_effective_key,
+            )
+
+    result: dict[str, Any] = {
+        "updated_at": datetime.now(UK_TZ).isoformat(),
+        "commodities": ledger,
+    }
+    store = Store(
+        hass,
+        TARIFF_HISTORY_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_tariff_history",
+    )
+    existing = await store.async_load() or {}
+    if "analysis" in existing:
+        result["analysis"] = existing["analysis"]
+    await store.async_save(result)
+    return result
 
 
 def _day_start(day: str) -> datetime:
@@ -60,7 +313,7 @@ def _yesterday(now_uk: datetime) -> str:
 
 
 def _settled_prefix(history: list[CostBreakdown]) -> list[CostBreakdown]:
-    """Return only the contiguous completed prefix whose P1D total is available."""
+    """Stop at the first day for which Glow has not published P1D yet."""
     settled: list[CostBreakdown] = []
     for breakdown in history:
         if breakdown.standing_charge_status == "daily_pending":
@@ -69,44 +322,15 @@ def _settled_prefix(history: list[CostBreakdown]) -> list[CostBreakdown]:
     return settled
 
 
-async def _entity_id(
-    hass: HomeAssistant,
-    site_id: str,
-    sensor_key: str,
-) -> str | None:
-    """Resolve one component sensor without waiting during a normal poll."""
-    from homeassistant.helpers import entity_registry as er
-
-    from .const import DOMAIN
-    from .identity import sensor_unique_id
-
-    registry = er.async_get(hass)
-    return registry.async_get_entity_id(
-        "sensor",
-        DOMAIN,
-        sensor_unique_id(site_id, sensor_key, None),
-    )
-
-
-async def _load_store(hass: HomeAssistant, site_id: str) -> tuple[Store, dict[str, Any]]:
-    store = Store(
-        hass,
-        COST_HISTORY_STORAGE_VERSION,
-        f"hildebrand_glow_{site_id}_cost_history",
-    )
-    return store, await store.async_load() or {}
-
-
 async def _reconcile_locked(
     hass: HomeAssistant,
     coordinator: GlowmarktDataUpdateCoordinator,
     site_id: str,
     tariff_ledger: dict[str, Any] | None,
 ) -> bool:
-    """Reconcile every available completed day and return whether history is usable."""
+    """Reconcile every available completed day."""
     store, state = await _load_store(hass, site_id)
-    schema_current = state.get("_ingestion_version") == COST_INGESTION_SCHEMA_VERSION
-    full_backfill = not schema_current
+    full_backfill = state.get("_ingestion_version") != COST_INGESTION_SCHEMA_VERSION
     commodity_state = state.setdefault("commodities", {})
     imported: dict[str, int] = {}
     tariff_analysis: dict[str, list[dict[str, Any]]] = {}
@@ -152,11 +376,6 @@ async def _reconcile_locked(
             start_uk=start_uk,
         )
         history = _settled_prefix(history)
-
-        # A current schema with no newly settled day is already safe to use if
-        # its completed marker reaches yesterday. This is the normal daytime path.
-        if not history and not full_backfill:
-            continue
         if not history:
             continue
 
@@ -184,8 +403,6 @@ async def _reconcile_locked(
 
         if total_stats:
             if full_backfill:
-                # The external statistic is 100% integration-owned, so a schema
-                # change can safely rebuild it and remove provisional/legacy rows.
                 await _clear_statistics(hass, [external_id])
             async_add_external_statistics(
                 hass,
@@ -235,7 +452,7 @@ async def _import_open_day_locked(
     site_id: str,
     now_uk: datetime,
 ) -> None:
-    """Overwrite provisional current-day external cost rows from PT30M snapshots."""
+    """Overwrite today's provisional Energy cost rows from all published PT30M data."""
     _store, state = await _load_store(hass, site_id)
     if state.get("_ingestion_version") != COST_INGESTION_SCHEMA_VERSION:
         return
@@ -244,17 +461,10 @@ async def _import_open_day_locked(
     yesterday = _yesterday(now_uk)
     commodity_state = state.get("commodities", {})
 
-    for commodity, (cost_classifier, _daily_key, _usage_key, _standing_key) in (
-        COMPONENT_KEYS.items()
-    ):
-        resource = coordinator.resources.get(cost_classifier)
-        if not resource:
+    for commodity, (cost_classifier, _daily, _usage, _standing) in COMPONENT_KEYS.items():
+        if cost_classifier not in coordinator.resources:
             continue
         previous = commodity_state.get(commodity, {})
-
-        # Never build today's cumulative sum on top of an unreconciled yesterday.
-        # The sensor still shows today's PT30M API value; the Energy cost statistic
-        # waits until its historical baseline is trustworthy.
         if previous.get("last_completed_day") != yesterday:
             continue
 
@@ -277,7 +487,7 @@ async def _import_open_day_locked(
             stats,
         )
         _LOGGER.debug(
-            "Imported %s provisional cost intervals for %s (%s)",
+            "Imported %s provisional PT30M cost intervals for %s (%s)",
             len(breakdown.usage_intervals),
             commodity,
             today,
