@@ -1,57 +1,62 @@
 # Home Assistant Energy dashboard
 
-The Hildebrand Glow integration supplies two related historical cost views because Home Assistant uses them for different purposes.
+Version 2.3.4 gives Hildebrand one statistics owner for Energy consumption and one tariff-first model for cost composition.
 
 ## Built-in Energy dashboard
 
 Configure **Settings → Dashboards → Energy → Electricity grid** with:
 
-- **Energy imported from grid:** `Smart Meter Electricity Consumption`
-- **Cost tracking:** select the dedicated Hildebrand Glow electricity cost statistic created by the integration. In Home Assistant it is named **Hildebrand Glow Electricity Energy Cost**.
+- **Energy imported from grid:** the external statistic named **Hildebrand Glow Electricity Energy Consumption**.
+- **Cost tracking:** the external statistic named **Hildebrand Glow Electricity Energy Cost**.
 
-Do not use `Total Daily Energy Cost` for the electricity grid. That entity combines electricity and gas when both commodities are available and would therefore attribute gas cost to electricity.
+Upgrading from an earlier 2.3.x release migrates an existing Hildebrand Energy source from the old live-sensor statistic to the stable external consumption statistic automatically. The visible `Electricity Consumption Today` sensor is deliberately presentation-only and is not a second long-term statistics writer.
 
-Do not rely on `Electricity Daily Cost` as the Energy dashboard's historical cost source. It remains a useful human-facing sensor for the latest/current billing day, but version 2.1.2 and later publish a dedicated cumulative external statistic for Energy-dashboard billing history. This matches Home Assistant's own delayed-billing integrations such as Opower.
+Do not use `Total Daily Energy Cost` for the electricity grid. That entity can combine electricity and gas when both commodities are available.
 
-The dedicated statistic is backfilled with:
+## Cost model
 
-- the authoritative completed P1D Glow cost for each UK-local day;
-- the original PT30M usage-cost shape where available;
-- the P1D-minus-PT30M residual folded into the first hour so the complete day's statistic still equals the Glow P1D bill;
-- a cumulative `sum` column, which is the value Home Assistant's Energy dashboard uses for historical cost.
+The integration first retrieves Glow's effective-dated `tariff-list` ledger.
 
-Recorder keeps sub-penny precision for imported cost data. The UI may still display normal currency rounding, but that display formatting no longer changes the accumulated billing statistic.
+For a flat tariff, each PT30M consumption interval is priced with the unit rate effective for that date:
 
-Version 2.1.5 rebuilds the integration-owned external Energy cost statistic once on upgrade. This removes stale tail rows left by earlier 2.1.x cost backfills that could make Home Assistant display a large negative cost. After that migration, incremental updates resume from Recorder's actual last persisted external `sum`, rather than trusting the integration's sidecar cache as the billing arithmetic authority.
+`usage cost = Σ(PT30M kWh × effective unit rate)`
 
-Cost history is then extended incrementally every six hours. A trailing completed day is not finalised until Glow has published its P1D bucket, so the integration does not accidentally treat a usage-only PT30M total as the final bill.
+The effective standing charge is then applied once for the UK-local billing day:
 
-For the current partial day, Glow PT30M cost is usage-only. The standing charge appears only after Glow publishes the completed P1D bucket.
+`total cost = usage cost + standing charge`
+
+For TOU or dynamic tariffs, where one flat unit rate cannot price the day correctly, Glow PT30M cost remains the usage-cost source and the effective tariff standing charge is still applied once.
+
+Glow P1D cost is retained as a reconciliation check for completed days. A material difference between the independently priced components and Glow P1D is logged and is also covered by the protected live-contract release test.
+
+The dedicated Energy total-cost statistic uses the same usage + standing composition as the stacked component chart. Its cumulative `sum` is Home Assistant plumbing; the user-facing values remain the dated hourly/daily costs.
+
+The current day can include the standing charge immediately once the effective tariff is known; it no longer has to wait for Glow's next-day P1D aggregate before the stacked chart can show the fixed daily charge.
 
 ## Reset imported history
 
-Version 2.2.0 adds a maintenance action under **Settings → Devices & services → Hildebrand Glow → Configure → Reset imported history**.
+Use **Settings → Devices & services → Hildebrand Glow → Configure → Reset imported history**.
 
-The reset is deliberately scoped to the selected Hildebrand meter site. It:
+The reset is scoped to the selected Hildebrand meter site. It:
 
-- clears Recorder statistics for the integration's sensor entities;
-- clears the dedicated Hildebrand electricity/gas Energy cost statistics;
-- removes the integration's cumulative-history, cost-history and tariff-ledger cache files;
-- preserves credentials, entity registry entries, dashboard configuration and all unrelated Home Assistant history;
-- reloads the config entry so consumption, cost and tariff history are rebuilt cleanly from Glow.
+- clears the integration-owned historical statistics;
+- clears the dedicated Hildebrand electricity/gas Energy statistics;
+- removes the integration's consumption, cost and tariff-ledger cache files;
+- preserves credentials, entity registry entries, dashboard configuration and unrelated Home Assistant history;
+- reloads the config entry so consumption, tariff and cost history are rebuilt deterministically from Glow.
 
-A confirmation screen is shown before any statistics are deleted. Because the statistic IDs remain stable, the Energy dashboard does not need to be reconfigured after a successful reset; it will repopulate as the backfill completes.
+The stable external statistic IDs mean an existing Energy dashboard can be migrated rather than manually rebuilt.
 
 ## Usage cost versus standing charge graph
 
-The integration also imports separate historical statistics for:
+The two component statistics are attached to the normal Hildebrand entities:
 
 - `Smart Meter Electricity Usage Cost`
 - `Smart Meter Electricity Standing Charge`
 
-These are intended for analysis and native stacked graphs rather than as the Energy dashboard's total-cost source.
+Both historical and current-day statistics are imported by the integration. The live entities deliberately do not carry a Recorder state class, which prevents Home Assistant from creating a competing second statistics series.
 
-Example native card:
+Example native stacked card:
 
 ```yaml
 type: statistics-graph
@@ -65,8 +70,14 @@ entities:
   - sensor.smart_meter_electricity_standing_charge
 ```
 
-Home Assistant may choose different entity IDs if the names already existed; use the entity picker if necessary.
+Each daily bar therefore reads as:
+
+- lower segment: actual usage cost at the effective tariff rate;
+- upper segment: that day's effective standing charge;
+- full bar height: the same daily total used by the dedicated Energy cost statistic.
+
+Home Assistant may choose different entity IDs if similarly named entities already existed; use the entity picker or the actual registry IDs in YAML.
 
 ## Gas
 
-When usable gas data is available, configure the Energy dashboard gas source with `Smart Meter Gas Consumption` and the dedicated **Hildebrand Glow Gas Energy Cost** statistic using the same pattern. If the DCC/Glow gas resource exists but currently has no readings, the gas entities remain `Unknown` rather than being treated as zero.
+Gas follows the same model when usable gas data is available: external consumption + external total-cost statistics for the Energy dashboard, and separate usage/standing component entities for stacked analysis. If a DCC/Glow gas resource exists but has no readings, the values remain unavailable rather than being silently treated as zero.
