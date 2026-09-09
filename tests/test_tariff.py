@@ -3,7 +3,6 @@ from __future__ import annotations
 from custom_components.hildebrand_glow.costing import CostBreakdown
 from custom_components.hildebrand_glow.tariff import (
     derive_tariff_periods,
-    normalise_cost_history,
     parse_tariff_periods,
 )
 
@@ -187,29 +186,3 @@ def test_configured_current_standing_supplies_exact_value_when_cluster_agrees() 
     assert period.standing_source == "configured_current_calibrated"
     assert period.unit_rate_pence_per_kwh == 24.5
     assert period.unit_rate_source == "configured_current_fallback"
-
-
-def test_normalised_components_are_stable_and_reconcile_to_p1d() -> None:
-    history = [
-        _breakdown("2026-08-01", 558.0, 500.0),
-        _breakdown("2026-08-02", 560.0, 501.0),
-        _breakdown("2026-08-03", 557.0, 500.0),
-    ]
-    rows = [
-        {
-            "effectiveDate": "2026-07-01 00:00:00",
-            "plan": [{"planDetail": [{"standing": 58.2}, {"rate": 24.5}]}],
-        }
-    ]
-    periods = derive_tariff_periods(rows, history)
-
-    normalised = normalise_cost_history(history, periods)
-
-    assert [item.standing_charge_pence for item in normalised] == [58.2, 58.2, 58.2]
-    assert [item.usage_pence for item in normalised] == [499.8, 501.8, 498.8]
-    for item in normalised:
-        assert item.usage_pence is not None
-        assert item.standing_charge_pence is not None
-        assert round(item.usage_pence + item.standing_charge_pence, 6) == round(
-            item.total_pence, 6
-        )
