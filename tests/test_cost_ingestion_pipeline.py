@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 import custom_components.hildebrand_glow.cost_ingestion as ingestion
-from custom_components.hildebrand_glow.api import DailyReading, GlowmarktApiError, UK_TZ
+from custom_components.hildebrand_glow.api import UK_TZ, DailyReading, GlowmarktApiError
 from custom_components.hildebrand_glow.const import (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_ELECTRICITY_COST,
@@ -126,17 +126,33 @@ async def test_full_reconcile_rebuilds_all_owned_cost_statistics(hass) -> None:
         writes.append((metadata, list(stats)))
 
     with (
-        patch.object(ingestion, "_load_store", new=AsyncMock(return_value=(store, store.state))),
-        patch.object(ingestion, "get_cost_history", new=AsyncMock(return_value=[raw])) as history,
+        patch.object(
+            ingestion,
+            "_load_store",
+            new=AsyncMock(return_value=(store, store.state)),
+        ),
+        patch.object(
+            ingestion,
+            "get_cost_history",
+            new=AsyncMock(return_value=[raw]),
+        ) as history,
         patch.object(
             ingestion,
             "_consumption_history",
             new=AsyncMock(return_value=[_reading("2026-09-07")]),
         ),
-        patch.object(ingestion, "_entity_id", new=AsyncMock(side_effect=["sensor.usage", "sensor.standing"])),
+        patch.object(
+            ingestion,
+            "_entity_id",
+            new=AsyncMock(side_effect=["sensor.usage", "sensor.standing"]),
+        ),
         patch.object(ingestion, "_clear_statistics", new=clear),
         patch.object(ingestion, "async_add_external_statistics", side_effect=capture),
-        patch.object(ingestion, "_save_tariff_analysis", new=AsyncMock()) as save_analysis,
+        patch.object(
+            ingestion,
+            "_save_tariff_analysis",
+            new=AsyncMock(),
+        ) as save_analysis,
     ):
         result = await ingestion._reconcile_locked(
             hass,
@@ -146,12 +162,26 @@ async def test_full_reconcile_rebuilds_all_owned_cost_statistics(hass) -> None:
         )
 
     assert result is True
-    history.assert_awaited_once_with(object.__getattribute__(coordinator, "api_client"), "cost-resource", start_uk=None)
+    history.assert_awaited_once_with(
+        coordinator.api_client,
+        "cost-resource",
+        start_uk=None,
+    )
     assert clear.await_count == 1
     cleared_ids = clear.await_args.args[1]
     assert ingestion.energy_cost_statistic_id("site-123", "electricity") in cleared_ids
-    assert ingestion.cost_component_statistic_id("site-123", "electricity", "usage_cost") in cleared_ids
-    assert ingestion.cost_component_statistic_id("site-123", "electricity", "standing_charge") in cleared_ids
+    assert (
+        ingestion.cost_component_statistic_id("site-123", "electricity", "usage_cost")
+        in cleared_ids
+    )
+    assert (
+        ingestion.cost_component_statistic_id(
+            "site-123",
+            "electricity",
+            "standing_charge",
+        )
+        in cleared_ids
+    )
     assert "sensor.usage" in cleared_ids
     assert "sensor.standing" in cleared_ids
 
@@ -159,8 +189,16 @@ async def test_full_reconcile_rebuilds_all_owned_cost_statistics(hass) -> None:
     ids = {metadata["statistic_id"] for metadata, _stats in writes}
     assert ids == {
         ingestion.energy_cost_statistic_id("site-123", "electricity"),
-        ingestion.cost_component_statistic_id("site-123", "electricity", "usage_cost"),
-        ingestion.cost_component_statistic_id("site-123", "electricity", "standing_charge"),
+        ingestion.cost_component_statistic_id(
+            "site-123",
+            "electricity",
+            "usage_cost",
+        ),
+        ingestion.cost_component_statistic_id(
+            "site-123",
+            "electricity",
+            "standing_charge",
+        ),
     }
     assert store.state["_ingestion_version"] == ingestion.COST_INGESTION_SCHEMA_VERSION
     assert store.state["commodities"]["electricity"] == {
@@ -197,7 +235,11 @@ async def test_incremental_reconcile_uses_previous_day_and_does_not_clear(hass) 
     )
 
     with (
-        patch.object(ingestion, "_load_store", new=AsyncMock(return_value=(store, state))),
+        patch.object(
+            ingestion,
+            "_load_store",
+            new=AsyncMock(return_value=(store, state)),
+        ),
         patch.object(
             ingestion,
             "get_cost_history",
@@ -263,7 +305,11 @@ async def test_open_day_publishes_total_usage_and_standing_from_closed_baseline(
             "_open_day_consumption",
             new=AsyncMock(return_value=_reading("2026-09-08")),
         ),
-        patch.object(ingestion, "async_add_external_statistics", side_effect=capture),
+        patch.object(
+            ingestion,
+            "async_add_external_statistics",
+            side_effect=capture,
+        ),
     ):
         await ingestion._import_open_day_locked(
             hass,
@@ -276,9 +322,19 @@ async def test_open_day_publishes_total_usage_and_standing_from_closed_baseline(
     assert len(writes) == 3
     by_id = {metadata["statistic_id"]: stats for metadata, stats in writes}
     total = by_id[ingestion.energy_cost_statistic_id("site-123", "electricity")]
-    usage = by_id[ingestion.cost_component_statistic_id("site-123", "electricity", "usage_cost")]
+    usage = by_id[
+        ingestion.cost_component_statistic_id(
+            "site-123",
+            "electricity",
+            "usage_cost",
+        )
+    ]
     standing = by_id[
-        ingestion.cost_component_statistic_id("site-123", "electricity", "standing_charge")
+        ingestion.cost_component_statistic_id(
+            "site-123",
+            "electricity",
+            "standing_charge",
+        )
     ]
     assert total[-1]["sum"] == 11.0
     assert usage[-1]["sum"] == 6.5
