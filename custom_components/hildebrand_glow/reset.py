@@ -1,4 +1,4 @@
-"""Safe reset helpers for Hildebrand Glow imported history."""
+"""Safe reset and one-time cleanup helpers for Hildebrand Glow statistics."""
 from __future__ import annotations
 
 import asyncio
@@ -20,6 +20,9 @@ from .cost_ingestion import (
 )
 from .identity import site_identity
 
+LEGACY_CLEANUP_STORAGE_VERSION = 1
+LEGACY_CLEANUP_SCHEMA_VERSION = 1
+
 
 def reset_statistic_ids(
     registry: er.EntityRegistry,
@@ -27,9 +30,9 @@ def reset_statistic_ids(
     site_id: str,
 ) -> list[str]:
     """Return all current and legacy Hildebrand statistics for one config entry."""
-    # Entity-backed IDs include legacy consumption/cost-component statistics from
-    # earlier releases. Keeping them in the reset set makes upgrades self-cleaning
-    # without touching unrelated Recorder data.
+    # Entity-backed IDs include legacy consumption/cost statistics from earlier
+    # releases. Keeping them in the reset set makes upgrades self-cleaning without
+    # touching unrelated Recorder data.
     statistic_ids = {
         entry.entity_id
         for entry in er.async_entries_for_config_entry(registry, config_entry.entry_id)
@@ -50,6 +53,29 @@ def reset_statistic_ids(
     return sorted(statistic_ids)
 
 
+def legacy_cleanup_statistic_ids(
+    registry: er.EntityRegistry,
+    config_entry: ConfigEntry,
+    site_id: str,
+) -> list[str]:
+    """Return obsolete Recorder-owned sensor stats plus cost stats to rebuild once.
+
+    Consumption external statistics are intentionally excluded: 2.3.4 already gave
+    them a single stable owner and 2.3.6 does not need to disturb that history.
+    Cost statistics are cleared because 2.3.6 changes their ownership/schema and
+    rebuilds them from Glow/tariff history.
+    """
+    consumption_ids = {
+        energy_consumption_statistic_id(site_id, "electricity"),
+        energy_consumption_statistic_id(site_id, "gas"),
+    }
+    return [
+        statistic_id
+        for statistic_id in reset_statistic_ids(registry, config_entry, site_id)
+        if statistic_id not in consumption_ids
+    ]
+
+
 async def _clear_statistics(hass: HomeAssistant, statistic_ids: list[str]) -> None:
     """Clear statistics and wait for Recorder to finish the queued operation."""
     if not statistic_ids:
@@ -62,6 +88,40 @@ async def _clear_statistics(hass: HomeAssistant, statistic_ids: list[str]) -> No
 
     get_instance(hass).async_clear_statistics(statistic_ids, on_done=_done)
     await done.wait()
+
+
+async def async_cleanup_legacy_statistics(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+) -> list[str]:
+    """Remove obsolete 2.3.x statistics once before the 2.3.6 cost rebuild.
+
+    Earlier releases allowed visible monetary sensors to compile Recorder-owned
+    long-term statistics. They are presentation-only from 2.3.6, so those metadata
+    rows are deleted once. The integration-owned cost statistics are also cleared so
+    the new schema rebuild starts from one deterministic source of truth.
+    """
+    site_id = site_identity(
+        config_entry.data.get(CONF_VIRTUAL_ENTITY),
+        config_entry.entry_id,
+    )
+    store = Store(
+        hass,
+        LEGACY_CLEANUP_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_statistics_cleanup",
+    )
+    state = await store.async_load() or {}
+    if int(state.get("schema_version", 0) or 0) >= LEGACY_CLEANUP_SCHEMA_VERSION:
+        return []
+
+    statistic_ids = legacy_cleanup_statistic_ids(
+        er.async_get(hass),
+        config_entry,
+        site_id,
+    )
+    await _clear_statistics(hass, statistic_ids)
+    await store.async_save({"schema_version": LEGACY_CLEANUP_SCHEMA_VERSION})
+    return statistic_ids
 
 
 async def async_reset_imported_history(
