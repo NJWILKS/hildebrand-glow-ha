@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from custom_components.hildebrand_glow.const import DOMAIN
 from custom_components.hildebrand_glow.cost_ingestion import (
+    _external_component_metadata,
     _settled_prefix,
     build_component_statistics,
     build_total_cost_statistics,
+    cost_component_statistic_id,
 )
 from custom_components.hildebrand_glow.costing import CostBreakdown
 
@@ -35,6 +38,27 @@ def _breakdown(
         complete_day=complete,
         usage_intervals=intervals,
     )
+
+
+def test_cost_component_statistics_have_stable_external_ids() -> None:
+    usage_id = cost_component_statistic_id("site-123", "electricity", "usage_cost")
+    standing_id = cost_component_statistic_id(
+        "site-123", "electricity", "standing_charge"
+    )
+
+    assert usage_id == "hildebrand_glow:site_123_electricity_usage_cost"
+    assert standing_id == "hildebrand_glow:site_123_electricity_standing_charge"
+
+    usage_metadata = _external_component_metadata(
+        "site-123", "electricity", "usage_cost"
+    )
+    standing_metadata = _external_component_metadata(
+        "site-123", "electricity", "standing_charge"
+    )
+    assert usage_metadata["source"] == DOMAIN
+    assert standing_metadata["source"] == DOMAIN
+    assert usage_metadata["statistic_id"] == usage_id
+    assert standing_metadata["statistic_id"] == standing_id
 
 
 def test_component_statistics_match_live_daily_reset_semantics() -> None:
