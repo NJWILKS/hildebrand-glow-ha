@@ -138,12 +138,38 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
 }
 
 
+def _sensor_is_supported(
+    sensor_key: str,
+    description: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> bool:
+    """Return whether the discovered account can supply this visible sensor."""
+    if sensor_key in {
+        CLASSIFIER_ELECTRICITY_CONSUMPTION,
+        CLASSIFIER_GAS_CONSUMPTION,
+    }:
+        return sensor_key in resources
+
+    commodity = description.get("diagnostic_commodity")
+    if commodity == "electricity":
+        return CLASSIFIER_ELECTRICITY_COST in resources
+    if commodity == "gas":
+        return CLASSIFIER_GAS_COST in resources
+
+    # The combined monetary sensors are useful only when at least one cost
+    # resource exists. Do not create permanently-unavailable entities otherwise.
+    return any(
+        classifier in resources
+        for classifier in (CLASSIFIER_ELECTRICITY_COST, CLASSIFIER_GAS_COST)
+    )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Create entities and own the single cost-ingestion worker for this entry."""
+    """Create supported entities and own the single cost-ingestion worker."""
     coordinator: GlowmarktDataUpdateCoordinator = hass.data[DOMAIN][
         config_entry.entry_id
     ]
@@ -160,6 +186,7 @@ async def async_setup_entry(
             site_id=site_id,
         )
         for sensor_key, description in SENSOR_DESCRIPTIONS.items()
+        if _sensor_is_supported(sensor_key, description, coordinator.resources)
     ]
     async_add_entities(entities)
 
