@@ -13,10 +13,7 @@ from homeassistant.components.recorder.models import (
     StatisticMeanType,
     StatisticMetaData,
 )
-from homeassistant.components.recorder.statistics import (
-    async_add_external_statistics,
-    async_import_statistics,
-)
+from homeassistant.components.recorder.statistics import async_add_external_statistics
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
@@ -42,8 +39,8 @@ _LOGGER = logging.getLogger(__name__)
 
 COST_HISTORY_STORAGE_VERSION = 1
 TARIFF_HISTORY_STORAGE_VERSION = 1
-COST_BACKFILL_SCHEMA_VERSION = 7
-COST_INGESTION_SCHEMA_VERSION = 2
+COST_BACKFILL_SCHEMA_VERSION = 8
+COST_INGESTION_SCHEMA_VERSION = 3
 INITIAL_DELAY_SECONDS = 30
 COST_HISTORY_REFRESH_SECONDS = 6 * 60 * 60
 TARIFF_REFRESH_SECONDS = 24 * 60 * 60
@@ -76,24 +73,23 @@ def _gbp_from_pence(value: float) -> float:
     return _round_stat(float(value) / 100.0)
 
 
-def _metadata(entity_id: str) -> StatisticMetaData:
-    """Metadata for integration-owned statistics attached to a sensor entity."""
-    return StatisticMetaData(
-        has_sum=True,
-        mean_type=StatisticMeanType.NONE,
-        name=None,
-        source="recorder",
-        statistic_id=entity_id,
-        unit_class=None,
-        unit_of_measurement="GBP",
-    )
+def _safe_stat_part(value: str) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", value.lower()).strip("_")
 
 
 def energy_cost_statistic_id(site_id: str, commodity: str) -> str:
     """Return the stable external Energy total-cost statistic ID."""
-    safe_site = re.sub(r"[^a-z0-9_]+", "_", site_id.lower()).strip("_")
-    safe_commodity = re.sub(r"[^a-z0-9_]+", "_", commodity.lower()).strip("_")
-    return f"{DOMAIN}:{safe_site}_{safe_commodity}_energy_cost"
+    return f"{DOMAIN}:{_safe_stat_part(site_id)}_{_safe_stat_part(commodity)}_energy_cost"
+
+
+def cost_component_statistic_id(site_id: str, commodity: str, component: str) -> str:
+    """Return a stable external usage-cost or standing-charge statistic ID."""
+    if component not in {"usage_cost", "standing_charge"}:
+        raise ValueError(f"Unsupported cost component: {component}")
+    return (
+        f"{DOMAIN}:{_safe_stat_part(site_id)}_{_safe_stat_part(commodity)}_"
+        f"{component}"
+    )
 
 
 def _external_cost_metadata(site_id: str, commodity: str) -> StatisticMetaData:
@@ -103,6 +99,22 @@ def _external_cost_metadata(site_id: str, commodity: str) -> StatisticMetaData:
         name=f"Hildebrand Glow {commodity.title()} Energy Cost",
         source=DOMAIN,
         statistic_id=energy_cost_statistic_id(site_id, commodity),
+        unit_class=None,
+        unit_of_measurement="GBP",
+    )
+
+
+def _external_component_metadata(
+    site_id: str,
+    commodity: str,
+    component: str,
+) -> StatisticMetaData:
+    return StatisticMetaData(
+        has_sum=True,
+        mean_type=StatisticMeanType.NONE,
+        name=f"Hildebrand Glow {commodity.title()} {component.replace('_', ' ').title()}",
+        source=DOMAIN,
+        statistic_id=cost_component_statistic_id(site_id, commodity, component),
         unit_class=None,
         unit_of_measurement="GBP",
     )
@@ -246,6 +258,7 @@ async def _entity_id(
     site_id: str,
     sensor_key: str,
 ) -> str | None:
+    """Resolve a legacy entity-backed component statistic for cleanup only."""
     registry = er.async_get(hass)
     return registry.async_get_entity_id(
         "sensor",
@@ -455,15 +468,6 @@ async def _reconcile_locked(
             continue
         consumption_resource = coordinator.resources.get(consumption_classifier)
 
-        usage_entity = await _entity_id(hass, site_id, usage_key)
-        standing_entity = await _entity_id(hass, site_id, standing_key)
-        if usage_entity is None or standing_entity is None:
-            _LOGGER.debug(
-                "Cost component entities not registered for %s; reconciliation deferred",
-                commodity,
-            )
-            return False
-
         previous = commodity_state.get(commodity, {}) if not full_backfill else {}
         completed_day = previous.get("last_completed_day") or previous.get("last_day")
         total_baseline = float(
@@ -518,12 +522,31 @@ async def _reconcile_locked(
             usage_baseline=usage_baseline,
             standing_baseline=standing_baseline,
         )
-        external_id = energy_cost_statistic_id(site_id, commodity)
+        total_external_id = energy_cost_statistic_id(site_id, commodity)
+        usage_external_id = cost_component_statistic_id(
+            site_id, commodity, "usage_cost"
+        )
+        standing_external_id = cost_component_statistic_id(
+            site_id, commodity, "standing_charge"
+        )
 
         if full_backfill:
+            legacy_component_ids = [
+                statistic_id
+                for statistic_id in (
+                    await _entity_id(hass, site_id, usage_key),
+                    await _entity_id(hass, site_id, standing_key),
+                )
+                if statistic_id is not None
+            ]
             await _clear_statistics(
                 hass,
-                [external_id, usage_entity, standing_entity],
+                [
+                    total_external_id,
+                    usage_external_id,
+                    standing_external_id,
+                    *legacy_component_ids,
+                ],
             )
 
         if total_stats:
@@ -533,9 +556,17 @@ async def _reconcile_locked(
                 total_stats,
             )
         if usage_stats:
-            async_import_statistics(hass, _metadata(usage_entity), usage_stats)
+            async_add_external_statistics(
+                hass,
+                _external_component_metadata(site_id, commodity, "usage_cost"),
+                usage_stats,
+            )
         if standing_stats:
-            async_import_statistics(hass, _metadata(standing_entity), standing_stats)
+            async_add_external_statistics(
+                hass,
+                _external_component_metadata(site_id, commodity, "standing_charge"),
+                standing_stats,
+            )
 
         commodity_state[commodity] = {
             "last_completed_day": history[-1].day,
@@ -603,8 +634,8 @@ async def _import_open_day_locked(
         cost_classifier,
         consumption_classifier,
         _daily,
-        usage_key,
-        standing_key,
+        _usage_key,
+        _standing_key,
     ) in COMPONENT_KEYS.items():
         if cost_classifier not in coordinator.resources:
             continue
@@ -658,11 +689,6 @@ async def _import_open_day_locked(
             standing_baseline=standing_baseline,
         )
 
-        usage_entity = await _entity_id(hass, site_id, usage_key)
-        standing_entity = await _entity_id(hass, site_id, standing_key)
-        if usage_entity is None or standing_entity is None:
-            continue
-
         if total_stats:
             async_add_external_statistics(
                 hass,
@@ -670,9 +696,17 @@ async def _import_open_day_locked(
                 total_stats,
             )
         if usage_stats:
-            async_import_statistics(hass, _metadata(usage_entity), usage_stats)
+            async_add_external_statistics(
+                hass,
+                _external_component_metadata(site_id, commodity, "usage_cost"),
+                usage_stats,
+            )
         if standing_stats:
-            async_import_statistics(hass, _metadata(standing_entity), standing_stats)
+            async_add_external_statistics(
+                hass,
+                _external_component_metadata(site_id, commodity, "standing_charge"),
+                standing_stats,
+            )
 
         if pricing:
             item = pricing[0]
