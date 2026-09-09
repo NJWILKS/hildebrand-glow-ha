@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -415,7 +414,6 @@ async def test_cost_refresh_handles_missing_none_error_and_success(hass) -> None
     assert coordinator._last_readings[CLASSIFIER_ELECTRICITY_COST].value == 100.0
     assert coordinator._last_cost_refresh_at == now
     sync.assert_awaited_once()
-
 
 
 def test_compose_costs_marks_unknown_standing_and_unavailable_commodity(hass) -> None:
