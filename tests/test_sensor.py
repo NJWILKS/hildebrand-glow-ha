@@ -8,6 +8,7 @@ from custom_components.hildebrand_glow.const import (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_ELECTRICITY_COST,
     CLASSIFIER_GAS_CONSUMPTION,
+    CLASSIFIER_GAS_COST,
     DOMAIN,
 )
 from custom_components.hildebrand_glow.sensor import (
@@ -23,6 +24,8 @@ def _coordinator(data: dict | None = None) -> MagicMock:
     coordinator.resources = {
         CLASSIFIER_ELECTRICITY_CONSUMPTION: {"resource_id": "electricity"},
         CLASSIFIER_ELECTRICITY_COST: {"resource_id": "electricity-cost"},
+        CLASSIFIER_GAS_CONSUMPTION: {"resource_id": "gas"},
+        CLASSIFIER_GAS_COST: {"resource_id": "gas-cost"},
     }
     return coordinator
 
@@ -156,7 +159,7 @@ async def test_sensor_setup_adds_entities_and_one_cost_worker(hass) -> None:
     )
 
 
-async def test_no_cost_resource_means_no_cost_worker(hass) -> None:
+async def test_unsupported_resource_sensors_are_not_created(hass) -> None:
     coordinator = _coordinator({})
     coordinator.resources = {
         CLASSIFIER_ELECTRICITY_CONSUMPTION: {"resource_id": "electricity"}
@@ -174,5 +177,9 @@ async def test_no_cost_resource_means_no_cost_worker(hass) -> None:
     ) as worker:
         await async_setup_entry(hass, entry, add_entities)
 
+    entities = add_entities.call_args.args[0]
+    assert [entity._sensor_key for entity in entities] == [
+        CLASSIFIER_ELECTRICITY_CONSUMPTION
+    ]
     worker.assert_not_called()
     entry.async_create_background_task.assert_not_called()
