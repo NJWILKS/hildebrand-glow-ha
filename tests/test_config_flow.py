@@ -24,6 +24,12 @@ from custom_components.hildebrand_glow.const import (
 )
 
 
+@pytest.fixture
+def mock_recorder_before_hass(recorder_db_url: str) -> None:
+    """Prepare Recorder before Home Assistant loads integration dependencies."""
+    assert recorder_db_url
+
+
 def test_options_flow_factory_does_not_assign_read_only_config_entry() -> None:
     flow = HildebrandGlowConfigFlow.async_get_options_flow(object())
 
