@@ -142,10 +142,15 @@ async def test_sensor_setup_adds_entities_and_one_cost_worker(hass) -> None:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     add_entities = MagicMock()
 
+    async def worker_coro() -> None:
+        return None
+
+    task = worker_coro()
+    worker = MagicMock(return_value=task)
     with patch(
         "custom_components.hildebrand_glow.sensor.async_cost_ingestion_worker",
-        return_value="worker",
-    ) as worker:
+        new=worker,
+    ):
         await async_setup_entry(hass, entry, add_entities)
 
     entities = add_entities.call_args.args[0]
@@ -154,9 +159,10 @@ async def test_sensor_setup_adds_entities_and_one_cost_worker(hass) -> None:
     worker.assert_called_once_with(hass, coordinator, "entry-1")
     entry.async_create_background_task.assert_called_once_with(
         hass,
-        "worker",
+        task,
         f"{DOMAIN} cost ingestion worker",
     )
+    task.close()
 
 
 async def test_unsupported_resource_sensors_are_not_created(hass) -> None:
