@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the Hildebrand Glow / Bright Home Assistant integration as of version 2.3.4.
+This document describes the Hildebrand Glow / Bright Home Assistant integration as of version 2.3.6.
 
 ## Design goals
 
@@ -41,7 +41,7 @@ The integration is designed to:
 
 ## Statistics ownership
 
-Version 2.3.4 removes the previous mixed ownership model.
+The integration avoids mixed Recorder/import ownership.
 
 For each commodity the integration owns an external Energy statistic, for example:
 
@@ -56,20 +56,27 @@ The cumulative `sum` is bookkeeping, not a user-facing physical meter register.
 
 The visible **Electricity Consumption Today** and **Gas Consumption Today** entities have no long-term state class. Recorder therefore cannot create a competing consumption statistic from them.
 
-Historical and current-day component cost statistics are likewise integration-owned where imported statistics are required.
+Cost follows the same ownership rule. For electricity, the integration owns:
+
+- `hildebrand_glow:<site>_electricity_energy_cost` for the native Home Assistant Energy cost source;
+- `hildebrand_glow:<site>_electricity_usage_cost` for stacked usage-cost analysis;
+- `hildebrand_glow:<site>_electricity_standing_charge` for stacked standing-charge analysis.
+
+Gas uses equivalent statistic IDs. The visible monetary sensor entities are presentation/diagnostic surfaces rather than the long-term statistics owner.
 
 ## Fresh install / schema rebuild
 
-On a fresh install or a consumption schema rebuild:
+On a fresh install or a statistics schema rebuild:
 
 1. discover the selected site's resources;
 2. use `first-time` as an approximate historical locator;
 3. resolve the first actual available PT30M reading;
 4. retrieve the available history in bounded chunks;
-5. clear legacy mixed-ownership consumption statistics plus the owned external IDs for this site;
-6. rebuild the external series deterministically;
+5. clear legacy mixed-ownership statistics plus the owned external IDs for this site;
+6. rebuild the external consumption and cost series deterministically;
 7. migrate Home Assistant Energy configuration from the legacy sensor statistic ID to the external statistic ID where applicable;
-8. continue writing the same external series for the current day.
+8. bind the matching external total-cost statistic when the Hildebrand external consumption source has no explicit alternative cost statistic;
+9. continue writing the same external series for the current day.
 
 Reset/rebuild must be idempotent: repeating it from the same Glow data produces the same statistics.
 
@@ -110,10 +117,24 @@ The worker:
 5. prices flat-tariff usage from consumption × rate;
 6. retains Glow PT30M usage cost for tariffs that cannot be represented by one rate;
 7. applies the effective standing charge once per UK-local day;
-8. imports Usage Cost, Standing Charge and total-cost statistics;
+8. writes total cost, Usage Cost and Standing Charge as integration-owned external statistics;
 9. reconciles completed-day totals against Glow P1D and logs material disagreement.
 
 This ordering matters: tariff information must be available before historical cost reconciliation.
+
+## Energy preference migration
+
+Home Assistant Energy stores the consumption statistic and cost source separately.
+
+When the Hildebrand consumption source is external, Home Assistant cannot validly use an entity price or fixed numeric price for that external statistic. Older Energy preferences can nevertheless retain one of those stale fields after migration.
+
+Version 2.3.6 repairs that state when no explicit alternative `stat_cost` has been selected:
+
+- stale `entity_energy_price` is cleared;
+- stale `number_energy_price` is cleared;
+- the matching `hildebrand_glow:<site>_<commodity>_energy_cost` statistic is bound as `stat_cost`.
+
+An explicitly selected alternative cost statistic is preserved.
 
 ## Tariff classification
 
@@ -173,4 +194,4 @@ Ordinary CI uses no Bright credentials and covers the deterministic/statistical 
 
 A separate protected live contract validates API semantics against a real Bright account, including DST geometry, tariff shape/classification, standing-charge evidence and flat-rate consumption × tariff pricing.
 
-The release-specific gates are documented in `docs/RELEASE_2_3_4_AUDIT.md`; the low-level statistics invariants are documented in `docs/STATISTICS_CONTRACT.md`.
+The release-specific gates are documented in `docs/RELEASE_2_3_4_AUDIT.md`.
