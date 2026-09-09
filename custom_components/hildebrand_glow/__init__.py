@@ -28,6 +28,8 @@ from .const import (
 )
 from .coordinator import GlowmarktDataUpdateCoordinator
 from .energy_migration import async_migrate_energy_consumption_statistics
+from .identity import site_identity
+from .interval_history import async_interval_history_worker
 from .reset import async_cleanup_legacy_statistics
 
 _LOGGER = logging.getLogger(__name__)
@@ -103,6 +105,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN][entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Build the new source-of-truth ledger independently of Recorder statistics.
+    # The task is owned by the config entry so unload/reload cancels it cleanly.
+    entry.async_create_background_task(
+        hass,
+        async_interval_history_worker(
+            hass,
+            client,
+            coordinator.resources,
+            site_identity(
+                entry.data.get(CONF_VIRTUAL_ENTITY),
+                entry.entry_id,
+            ),
+        ),
+        f"{DOMAIN} PT30M interval history population",
+    )
 
     # 2.3.4 migrated Energy consumption to an external statistic but did not
     # attach the integration-owned external cost statistic to the same Energy
