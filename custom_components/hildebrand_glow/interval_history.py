@@ -152,6 +152,12 @@ async def _load_tariffs(
     resources: dict[str, dict[str, Any]],
     cost_classifier: str,
 ) -> dict[str, Any]:
+    """Return raw and normalized effective-dated tariff metadata.
+
+    Tariffs deliberately live outside interval rows. A later projection joins
+    them by timestamp so a revised/backdated tariff never requires rewriting the
+    raw PT30M usage and cost ledger.
+    """
     resource = resources.get(cost_classifier)
     if not resource:
         return {"raw": [], "periods": []}
