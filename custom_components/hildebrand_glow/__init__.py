@@ -1,6 +1,9 @@
 """The Hildebrand Glow integration."""
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
@@ -27,6 +30,7 @@ from .coordinator import GlowmarktDataUpdateCoordinator
 from .energy_migration import async_migrate_energy_consumption_statistics
 from .reset import async_cleanup_legacy_statistics
 
+_LOGGER = logging.getLogger(__name__)
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 
@@ -55,6 +59,19 @@ def _tariff_config(entry: ConfigEntry) -> dict[str, float]:
             )
         ),
     }
+
+
+async def _async_cleanup_legacy_statistics_after_setup(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> None:
+    """Clear obsolete Recorder statistics without holding up config-entry setup."""
+    try:
+        await async_cleanup_legacy_statistics(hass, entry)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOGGER.exception("Failed to clean up legacy Hildebrand statistics")
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -87,16 +104,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # 2.3.6 makes every visible sensor presentation-only and moves all long-term
-    # cost history to integration-owned external statistics. Remove the obsolete
-    # Recorder-owned sensor statistics once before rebuilding the new cost schema.
-    await async_cleanup_legacy_statistics(hass, entry)
-
     # 2.3.4 migrated Energy consumption to an external statistic but did not
     # attach the integration-owned external cost statistic to the same Energy
     # source. Re-run the preference repair on every setup so existing installs
     # pick up cost history without requiring the source to be removed/re-added.
     await async_migrate_energy_consumption_statistics(hass, {})
+
+    # 2.3.6 makes visible sensors presentation-only. Earlier versions may have
+    # Recorder-owned long-term statistics attached to those entity IDs. Clearing
+    # them can legitimately wait behind Recorder work, so it must never block the
+    # config-entry setup/bootstrap path. The cleanup touches only legacy sensor IDs;
+    # external consumption/cost statistics keep their normal independent owners.
+    entry.async_create_background_task(
+        hass,
+        _async_cleanup_legacy_statistics_after_setup(hass, entry),
+        f"{DOMAIN} legacy statistics cleanup",
+    )
 
     coordinator.schedule_history_backfill()
     entry.async_on_unload(entry.add_update_listener(async_update_options))
