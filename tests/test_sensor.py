@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from homeassistant.components.sensor import SensorDeviceClass
 
@@ -140,15 +140,24 @@ async def test_sensor_setup_adds_entities_and_one_cost_worker(hass) -> None:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     add_entities = MagicMock()
 
-    await async_setup_entry(hass, entry, add_entities)
+    with patch(
+        "custom_components.hildebrand_glow.sensor.async_cost_ingestion_worker",
+        return_value="worker",
+    ) as worker:
+        await async_setup_entry(hass, entry, add_entities)
 
     entities = add_entities.call_args.args[0]
     assert len(entities) == len(SENSOR_DESCRIPTIONS)
     assert {entity._sensor_key for entity in entities} == set(SENSOR_DESCRIPTIONS)
-    entry.async_create_background_task.assert_called_once()
+    worker.assert_called_once_with(hass, coordinator, "entry-1")
+    entry.async_create_background_task.assert_called_once_with(
+        hass,
+        "worker",
+        f"{DOMAIN} cost ingestion worker",
+    )
 
 
-def test_no_cost_resource_means_no_cost_worker(hass) -> None:
+async def test_no_cost_resource_means_no_cost_worker(hass) -> None:
     coordinator = _coordinator({})
     coordinator.resources = {
         CLASSIFIER_ELECTRICITY_CONSUMPTION: {"resource_id": "electricity"}
@@ -160,8 +169,11 @@ def test_no_cost_resource_means_no_cost_worker(hass) -> None:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     add_entities = MagicMock()
 
-    import asyncio
+    with patch(
+        "custom_components.hildebrand_glow.sensor.async_cost_ingestion_worker",
+        return_value="worker",
+    ) as worker:
+        await async_setup_entry(hass, entry, add_entities)
 
-    asyncio.run(async_setup_entry(hass, entry, add_entities))
-
+    worker.assert_not_called()
     entry.async_create_background_task.assert_not_called()
