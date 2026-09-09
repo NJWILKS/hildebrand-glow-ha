@@ -16,8 +16,8 @@ from custom_components.hildebrand_glow.const import (
 
 
 @pytest.mark.asyncio
-async def test_sensor_platform_owns_exactly_one_cost_worker() -> None:
-    """Regression: setup must not create duplicate cost-ingestion workers."""
+async def test_sensor_platform_starts_no_legacy_cost_worker() -> None:
+    """2.5 runtime must leave historical cost population to the interval ledger."""
     coordinator = SimpleNamespace(
         resources={CLASSIFIER_ELECTRICITY_COST: {"resource_id": "cost-resource"}}
     )
@@ -32,34 +32,15 @@ async def test_sensor_platform_owns_exactly_one_cost_worker() -> None:
     )
     add_entities = MagicMock()
 
-    async def worker_target() -> None:
-        return None
+    with patch.object(sensor_platform, "GlowmarktSensor", return_value=MagicMock()):
+        await sensor_platform.async_setup_entry(hass, entry, add_entities)
 
-    scheduled_worker = worker_target()
-    worker = MagicMock(return_value=scheduled_worker)
-
-    try:
-        with (
-            patch.object(sensor_platform, "GlowmarktSensor", return_value=MagicMock()),
-            patch.object(
-                sensor_platform,
-                "async_cost_ingestion_worker",
-                new=worker,
-            ),
-        ):
-            await sensor_platform.async_setup_entry(hass, entry, add_entities)
-
-        worker.assert_called_once_with(hass, coordinator, "site-123")
-        assert created == [
-            (scheduled_worker, f"{DOMAIN} cost ingestion worker")
-        ]
-    finally:
-        scheduled_worker.close()
+    assert created == []
 
 
 @pytest.mark.asyncio
 async def test_cost_worker_fetches_tariff_ledger_before_first_reconcile() -> None:
-    """Regression: historical costs are always rebuilt from tariff history first."""
+    """Keep legacy worker semantics covered while it is disconnected from runtime."""
     events: list[str] = []
     ledger = {
         "commodities": {
