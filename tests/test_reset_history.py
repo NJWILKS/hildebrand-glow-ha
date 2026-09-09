@@ -7,7 +7,10 @@ from custom_components.hildebrand_glow.const import CONF_VIRTUAL_ENTITY, DOMAIN
 from custom_components.hildebrand_glow.consumption_statistics import (
     energy_consumption_statistic_id,
 )
-from custom_components.hildebrand_glow.cost_ingestion import energy_cost_statistic_id
+from custom_components.hildebrand_glow.cost_ingestion import (
+    cost_component_statistic_id,
+    energy_cost_statistic_id,
+)
 from custom_components.hildebrand_glow.reset import reset_statistic_ids
 
 
@@ -42,3 +45,16 @@ def test_reset_statistic_ids_are_scoped_to_entry_and_external_energy_stats(hass)
     assert energy_consumption_statistic_id("site-123", "gas") in statistic_ids
     assert energy_cost_statistic_id("site-123", "electricity") in statistic_ids
     assert energy_cost_statistic_id("site-123", "gas") in statistic_ids
+    assert (
+        cost_component_statistic_id("site-123", "electricity", "usage_cost")
+        in statistic_ids
+    )
+    assert (
+        cost_component_statistic_id("site-123", "electricity", "standing_charge")
+        in statistic_ids
+    )
+    assert cost_component_statistic_id("site-123", "gas", "usage_cost") in statistic_ids
+    assert (
+        cost_component_statistic_id("site-123", "gas", "standing_charge")
+        in statistic_ids
+    )
