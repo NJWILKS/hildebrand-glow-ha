@@ -36,6 +36,22 @@ def _entry_sensor_statistic_ids(
     }
 
 
+def _legacy_cleanup_store(hass: HomeAssistant, site_id: str) -> Store:
+    """Return the one-time legacy statistics-cleanup marker store."""
+    return Store(
+        hass,
+        LEGACY_CLEANUP_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_statistics_cleanup",
+    )
+
+
+async def _mark_legacy_cleanup_complete(hass: HomeAssistant, site_id: str) -> None:
+    """Record that obsolete visible-sensor statistics have been cleared."""
+    await _legacy_cleanup_store(hass, site_id).async_save(
+        {"schema_version": LEGACY_CLEANUP_SCHEMA_VERSION}
+    )
+
+
 def reset_statistic_ids(
     registry: er.EntityRegistry,
     config_entry: ConfigEntry,
@@ -99,18 +115,14 @@ async def async_cleanup_legacy_statistics(
         config_entry.data.get(CONF_VIRTUAL_ENTITY),
         config_entry.entry_id,
     )
-    store = Store(
-        hass,
-        LEGACY_CLEANUP_STORAGE_VERSION,
-        f"{DOMAIN}_{site_id}_statistics_cleanup",
-    )
+    store = _legacy_cleanup_store(hass, site_id)
     state = await store.async_load() or {}
     if int(state.get("schema_version", 0) or 0) >= LEGACY_CLEANUP_SCHEMA_VERSION:
         return []
 
     statistic_ids = legacy_entity_statistic_ids(er.async_get(hass), config_entry)
     await _clear_statistics(hass, statistic_ids)
-    await store.async_save({"schema_version": LEGACY_CLEANUP_SCHEMA_VERSION})
+    await _mark_legacy_cleanup_complete(hass, site_id)
     return statistic_ids
 
 
@@ -130,6 +142,11 @@ async def async_reset_imported_history(
     )
     statistic_ids = reset_statistic_ids(er.async_get(hass), config_entry, site_id)
     await _clear_statistics(hass, statistic_ids)
+
+    # A full reset already clears every legacy entity-backed statistic, so record
+    # that cleanup as complete. The immediate config-entry setup must not queue the
+    # same Recorder clear operation again during Home Assistant bootstrap/reload.
+    await _mark_legacy_cleanup_complete(hass, site_id)
 
     stores = (
         Store(

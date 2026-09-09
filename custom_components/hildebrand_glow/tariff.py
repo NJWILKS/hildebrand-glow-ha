@@ -332,35 +332,6 @@ def derive_tariff_periods(
     return resolved
 
 
-def normalise_cost_history(
-    history: list[CostBreakdown], periods: list[TariffPeriod]
-) -> list[CostBreakdown]:
-    """Apply stable effective-dated standing charges to completed P1D bills."""
-    normalised: list[CostBreakdown] = []
-    for breakdown in history:
-        day = date.fromisoformat(breakdown.day)
-        period = next((item for item in periods if _contains(item, day)), None)
-        if (
-            period is None
-            or period.standing_pence is None
-            or not breakdown.complete_day
-            or breakdown.total_pence < period.standing_pence
-        ):
-            normalised.append(breakdown)
-            continue
-
-        standing = _round_pence(period.standing_pence)
-        normalised.append(
-            replace(
-                breakdown,
-                usage_pence=_round_pence(float(breakdown.total_pence) - standing),
-                standing_charge_pence=standing,
-                standing_charge_status=period.standing_source,
-            )
-        )
-    return normalised
-
-
 def tariff_period_as_dict(period: TariffPeriod) -> dict[str, Any]:
     """Return JSON-safe tariff-period diagnostics for Home Assistant Store."""
     value = asdict(period)
