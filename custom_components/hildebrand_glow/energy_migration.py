@@ -41,16 +41,13 @@ def _bind_owned_cost(source: dict) -> bool:
     if cost_statistic is None or source.get("stat_cost") is not None:
         return False
 
-    changed = False
     if source.get("entity_energy_price") is not None:
         source["entity_energy_price"] = None
-        changed = True
     if source.get("number_energy_price") is not None:
         source["number_energy_price"] = None
-        changed = True
 
     source["stat_cost"] = cost_statistic
-    return True or changed
+    return True
 
 
 async def async_migrate_energy_consumption_statistics(
