@@ -12,13 +12,12 @@ from custom_components.hildebrand_glow.const import CONF_VIRTUAL_ENTITY, DOMAIN
 
 @pytest.mark.asyncio
 async def test_config_entry_setup_does_not_wait_for_legacy_statistics_cleanup(
-    hass,
     recorder_mock,
+    hass,
 ) -> None:
     """Recorder cleanup may be slow, but it must never hold bootstrap open."""
-    # The integration declares recorder/energy dependencies. Use the real recorder
-    # test fixture so this regression exercises Home Assistant's config-entry setup
-    # path rather than failing before our integration is reached.
+    # Recorder must be initialised before the hass fixture is consumed. This keeps
+    # the regression on Home Assistant's real dependency/config-entry setup path.
     assert recorder_mock is not None
 
     entry = MockConfigEntry(
