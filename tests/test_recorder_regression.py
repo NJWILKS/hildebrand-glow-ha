@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import (
-    async_import_statistics,
+    async_add_external_statistics,
     statistics_during_period,
 )
 from pytest_homeassistant_custom_component.components.recorder.common import (
@@ -19,8 +19,9 @@ from custom_components.hildebrand_glow.consumption_statistics import (
     energy_consumption_statistic_id,
 )
 from custom_components.hildebrand_glow.cost_ingestion import (
-    _metadata,
+    _external_component_metadata,
     build_component_statistics,
+    cost_component_statistic_id,
 )
 from custom_components.hildebrand_glow.costing import CostBreakdown
 
@@ -54,16 +55,24 @@ async def _clear(hass, statistic_ids: list[str]) -> None:
     await async_recorder_block_till_done(hass)
 
 
-async def _stats(hass, statistic_id: str, start: datetime, end: datetime) -> list[dict]:
+async def _stats(
+    hass,
+    statistic_id: str,
+    start: datetime,
+    end: datetime,
+    *,
+    period: str = "hour",
+    types: set[str] | None = None,
+) -> list[dict]:
     result = await hass.async_add_executor_job(
         statistics_during_period,
         hass,
         start,
         end,
         {statistic_id},
-        "hour",
+        period,
         None,
-        {"start", "state", "sum"},
+        types or {"state", "sum"},
     )
     return result.get(statistic_id, [])
 
@@ -134,11 +143,11 @@ async def test_reset_rebuild_cannot_create_negative_energy_delta(
 
 
 @pytest.mark.asyncio
-async def test_real_recorder_persists_stackable_usage_and_standing_components(
+async def test_real_recorder_persists_external_stackable_cost_components(
     hass,
     recorder_mock,
 ) -> None:
-    """The two bar-chart components persist as independent, additive daily stats."""
+    """External usage/standing stats persist and produce additive daily changes."""
     start = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
     breakdown = CostBreakdown(
         day="2026-09-08",
@@ -150,11 +159,21 @@ async def test_real_recorder_persists_stackable_usage_and_standing_components(
         usage_intervals=((start, 24.5), (start + timedelta(minutes=30), 24.5)),
     )
     usage_stats, standing_stats = build_component_statistics([breakdown])
-    usage_id = "sensor.hildebrand_test_usage_cost"
-    standing_id = "sensor.hildebrand_test_standing_charge"
+    usage_id = cost_component_statistic_id("site-123", "electricity", "usage_cost")
+    standing_id = cost_component_statistic_id(
+        "site-123", "electricity", "standing_charge"
+    )
 
-    async_import_statistics(hass, _metadata(usage_id), usage_stats)
-    async_import_statistics(hass, _metadata(standing_id), standing_stats)
+    async_add_external_statistics(
+        hass,
+        _external_component_metadata("site-123", "electricity", "usage_cost"),
+        usage_stats,
+    )
+    async_add_external_statistics(
+        hass,
+        _external_component_metadata("site-123", "electricity", "standing_charge"),
+        standing_stats,
+    )
     await async_recorder_block_till_done(hass)
 
     end = start + timedelta(days=1)
@@ -165,7 +184,27 @@ async def test_real_recorder_persists_stackable_usage_and_standing_components(
     assert standing_rows
     assert round(float(usage_rows[-1]["state"]), 6) == 0.49
     assert round(float(standing_rows[-1]["state"]), 6) == 0.582
+
+    usage_daily = await _stats(
+        hass,
+        usage_id,
+        start,
+        end,
+        period="day",
+        types={"change"},
+    )
+    standing_daily = await _stats(
+        hass,
+        standing_id,
+        start,
+        end,
+        period="day",
+        types={"change"},
+    )
+
+    assert round(float(usage_daily[-1]["change"]), 6) == 0.49
+    assert round(float(standing_daily[-1]["change"]), 6) == 0.582
     assert round(
-        float(usage_rows[-1]["state"]) + float(standing_rows[-1]["state"]),
+        float(usage_daily[-1]["change"]) + float(standing_daily[-1]["change"]),
         6,
     ) == 1.072
