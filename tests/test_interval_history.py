@@ -86,7 +86,7 @@ def _resources() -> dict[str, dict[str, Any]]:
 
 
 @pytest.mark.asyncio
-async def test_population_stores_pt30m_usage_cost_and_tariff_reference() -> None:
+async def test_population_stores_raw_pt30m_facts_and_separate_tariff_ledger() -> None:
     first = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
     api = FakeApi(
         first={"electricity-usage": first, "electricity-cost": first},
@@ -132,12 +132,13 @@ async def test_population_stores_pt30m_usage_cost_and_tariff_reference() -> None
         "2026-01-01T00:30:00+00:00",
         "2026-01-01T01:00:00+00:00",
     ]
-    assert intervals["2026-01-01T00:00:00+00:00"]["usage_kwh"] == 0.0
+    assert intervals["2026-01-01T00:00:00+00:00"] == {
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "usage_kwh": 0.0,
+        "cost_pence": 1.0,
+    }
     assert intervals["2026-01-01T00:30:00+00:00"]["cost_pence"] is None
-    assert (
-        intervals["2026-01-01T01:00:00+00:00"]["tariff_effective_from"]
-        == "2026-01-01"
-    )
+    assert "tariff_effective_from" not in intervals["2026-01-01T01:00:00+00:00"]
 
 
 @pytest.mark.asyncio
