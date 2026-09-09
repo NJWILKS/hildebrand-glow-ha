@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
+import pytest
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -12,6 +15,7 @@ from custom_components.hildebrand_glow.cost_ingestion import (
     energy_cost_statistic_id,
 )
 from custom_components.hildebrand_glow.reset import (
+    async_cleanup_legacy_statistics,
     legacy_cleanup_statistic_ids,
     reset_statistic_ids,
 )
@@ -87,3 +91,21 @@ def test_upgrade_cleanup_preserves_external_consumption_but_removes_old_cost_sta
         cost_component_statistic_id("site-123", "electricity", "standing_charge")
         in statistic_ids
     )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_cleanup_runs_only_once(hass) -> None:
+    """Restarting 2.3.6 must not delete freshly rebuilt statistics again."""
+    entry, _registry, sensor, _button = _entry_and_registry(hass)
+    clear_statistics = AsyncMock()
+
+    with patch(
+        "custom_components.hildebrand_glow.reset._clear_statistics",
+        new=clear_statistics,
+    ):
+        first = await async_cleanup_legacy_statistics(hass, entry)
+        second = await async_cleanup_legacy_statistics(hass, entry)
+
+    assert sensor.entity_id in first
+    assert second == []
+    clear_statistics.assert_awaited_once()
