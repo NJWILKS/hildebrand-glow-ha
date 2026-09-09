@@ -15,6 +15,7 @@ from .coordinator import CUMULATIVE_STORAGE_VERSION
 from .cost_ingestion import (
     COST_HISTORY_STORAGE_VERSION,
     TARIFF_HISTORY_STORAGE_VERSION,
+    cost_component_statistic_id,
     energy_cost_statistic_id,
 )
 from .identity import site_identity
@@ -26,9 +27,9 @@ def reset_statistic_ids(
     site_id: str,
 ) -> list[str]:
     """Return all current and legacy Hildebrand statistics for one config entry."""
-    # Entity-backed IDs include legacy consumption statistics from <=2.3.3 as well
-    # as current monetary sensor statistics. Keeping them in the reset set makes
-    # upgrades self-cleaning without touching unrelated Recorder data.
+    # Entity-backed IDs include legacy consumption/cost-component statistics from
+    # earlier releases. Keeping them in the reset set makes upgrades self-cleaning
+    # without touching unrelated Recorder data.
     statistic_ids = {
         entry.entity_id
         for entry in er.async_entries_for_config_entry(registry, config_entry.entry_id)
@@ -40,6 +41,10 @@ def reset_statistic_ids(
             energy_consumption_statistic_id(site_id, "gas"),
             energy_cost_statistic_id(site_id, "electricity"),
             energy_cost_statistic_id(site_id, "gas"),
+            cost_component_statistic_id(site_id, "electricity", "usage_cost"),
+            cost_component_statistic_id(site_id, "electricity", "standing_charge"),
+            cost_component_statistic_id(site_id, "gas", "usage_cost"),
+            cost_component_statistic_id(site_id, "gas", "standing_charge"),
         }
     )
     return sorted(statistic_ids)
