@@ -143,20 +143,17 @@ async def test_cost_history_returns_empty_without_first_reading_or_for_today_onl
 
 @pytest.mark.asyncio
 async def test_cost_history_chunks_usage_and_daily_and_merges_union_of_days() -> None:
-    now = datetime(2026, 10, 20, 12, 0, tzinfo=UK_TZ)
+    now = datetime(2026, 9, 17, 12, 0, tzinfo=UK_TZ)
     start = datetime(2026, 8, 30, 17, 0, tzinfo=UK_TZ)
     day1 = datetime(2026, 8, 30, tzinfo=UK_TZ)
     day2 = datetime(2026, 9, 2, tzinfo=UK_TZ)
     day3 = datetime(2026, 9, 3, tzinfo=UK_TZ)
 
-    usage_chunks = 2
-    daily_chunks = 2
     api = FakeApi(
         [
             [[_epoch(day1), 10.0], [_epoch(day2), 20.0]],
             [],
             [[_epoch(day1), 60.0], [_epoch(day3), 70.0]],
-            [],
         ],
         first=start,
     )
@@ -172,8 +169,8 @@ async def test_cost_history_chunks_usage_and_daily_and_merges_union_of_days() ->
     assert history[0].standing_charge_pence == 50.0
     assert history[1].standing_charge_status == "daily_pending"
     assert history[2].usage_pence is None
-    assert sum(call[3] == "PT30M" for call in api.calls) == usage_chunks
-    assert sum(call[3] == "P1D" for call in api.calls) == daily_chunks
+    assert sum(call[3] == "PT30M" for call in api.calls) == 2
+    assert sum(call[3] == "P1D" for call in api.calls) == 1
     assert api.calls[0][2] - api.calls[0][1] <= timedelta(days=HISTORY_INTERVAL_DAYS)
     first_daily = next(call for call in api.calls if call[3] == "P1D")
     assert first_daily[2] - first_daily[1] <= timedelta(days=COST_DAILY_INTERVAL_DAYS)
