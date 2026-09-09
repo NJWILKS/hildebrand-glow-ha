@@ -208,11 +208,9 @@ class HildebrandGlowOptionsFlow(config_entries.OptionsFlow):
     ) -> FlowResult:
         """Change tariff and polling settings."""
         if user_input is not None:
-            new_data = {**self.config_entry.data, **user_input}
-            self.hass.config_entries.async_update_entry(
-                self.config_entry,
-                data=new_data,
-            )
+            # Keep credentials/site identity immutable in config-entry data. Home
+            # Assistant owns settings changes through the options payload and the
+            # registered update listener applies them to the live coordinator.
             return self.async_create_entry(title="", data=user_input)
 
         current_data = {**self.config_entry.data, **self.config_entry.options}
