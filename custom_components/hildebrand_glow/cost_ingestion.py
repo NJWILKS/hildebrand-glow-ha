@@ -18,7 +18,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
 
-from .api import HISTORY_INTERVAL_DAYS, DailyReading, GlowmarktApiError, UK_TZ
+from .api import HISTORY_INTERVAL_DAYS, UK_TZ, DailyReading, GlowmarktApiError
 from .const import (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_ELECTRICITY_COST,
@@ -39,7 +39,6 @@ _LOGGER = logging.getLogger(__name__)
 
 COST_HISTORY_STORAGE_VERSION = 1
 TARIFF_HISTORY_STORAGE_VERSION = 1
-COST_BACKFILL_SCHEMA_VERSION = 8
 COST_INGESTION_SCHEMA_VERSION = 3
 INITIAL_DELAY_SECONDS = 30
 COST_HISTORY_REFRESH_SECONDS = 6 * 60 * 60
@@ -584,8 +583,6 @@ async def _reconcile_locked(
         }
         imported[commodity] = len(history)
 
-    state["_backfilled"] = True
-    state["_backfilled_version"] = COST_BACKFILL_SCHEMA_VERSION
     state["_ingestion_version"] = COST_INGESTION_SCHEMA_VERSION
     await store.async_save(state)
     if tariff_analysis:
