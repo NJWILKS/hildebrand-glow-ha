@@ -11,7 +11,7 @@ Configure **Settings → Dashboards → Energy → Electricity grid** with:
 
 Upgrading from an earlier 2.3.x release migrates an existing Hildebrand Energy source from the old live-sensor statistic to the stable external consumption statistic automatically. Version 2.3.6 also repairs stale fixed/entity price fields left behind on an already-external Hildebrand source and binds the matching external total-cost statistic when no explicit alternative cost statistic is selected.
 
-The visible `Electricity Consumption Today` sensor is deliberately presentation-only and is not a second long-term statistics writer.
+All visible Hildebrand sensors are presentation/diagnostic surfaces in 2.3.6 and deliberately have no Recorder state class. They therefore cannot recreate a second long-term statistics series.
 
 Do not use `Total Daily Energy Cost` for the electricity grid. That entity can combine electricity and gas when both commodities are available.
 
@@ -34,6 +34,14 @@ Glow P1D cost is retained as a reconciliation check for completed days. A materi
 The dedicated Energy total-cost statistic uses the same usage + standing composition as the stacked component chart. Its cumulative `sum` is Home Assistant plumbing; the user-facing values remain the dated hourly/daily costs.
 
 The current day can include the standing charge immediately once the effective tariff is known; it no longer has to wait for Glow's next-day P1D aggregate before the stacked chart can show the fixed daily charge.
+
+## Upgrade cleanup
+
+On the first 2.3.6 setup for each Hildebrand site, the integration removes obsolete Recorder statistics belonging to its visible sensor entity IDs. It does **not** delete the entities themselves and does not touch the integration-owned external statistics.
+
+This is intentionally narrower than a name/prefix cleanup: only sensors registered to the current config entry are selected. That preserves dashboards, entity registry entries, credentials, external Energy history and unrelated Home Assistant statistics. A small per-site marker makes the cleanup one-time so a later restart cannot delete freshly rebuilt data.
+
+The cost-ingestion schema migration separately clears/rebuilds the external total-cost, usage-cost and standing-charge statistics when their schema changes.
 
 ## Reset imported history
 
