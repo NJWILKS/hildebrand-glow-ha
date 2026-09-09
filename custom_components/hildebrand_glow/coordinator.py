@@ -44,10 +44,6 @@ CUMULATIVE_CLASSIFIERS = (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_GAS_CONSUMPTION,
 )
-API_COST_CLASSIFIERS = (
-    CLASSIFIER_ELECTRICITY_COST,
-    CLASSIFIER_GAS_COST,
-)
 COMMODITY_CLASSIFIERS = {
     "electricity": (
         CLASSIFIER_ELECTRICITY_CONSUMPTION,
@@ -98,7 +94,6 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api_client = api_client
         self.tariff_config = tariff_config
         self._virtual_entity_id = virtual_entity_id
-        self._entry_id = entry_id
         self._site_id = site_identity(virtual_entity_id, entry_id)
         self._resources: dict[str, dict[str, Any]] = {}
         self._last_readings: dict[str, DailyReading] = {}
@@ -141,9 +136,8 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> float:
         """Write one reading through the integration-owned Energy statistic."""
         if not reading.intervals:
-            # Compatibility for callers/tests without interval geometry. Real API
-            # history is interval-backed, so there is intentionally nothing to
-            # publish to Energy when no timestamped rows exist.
+            # Compatibility for tests without interval geometry. Real API history is
+            # interval-backed, so there is intentionally nothing to publish to Energy.
             return round(float(baseline) + float(reading.value), 3)
         commodity = CONSUMPTION_COMMODITY[classifier]
         _stats, ending = add_consumption_statistics(
@@ -224,42 +218,6 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             value=round(sum(value for _timestamp, value in intervals), 3),
             intervals=intervals,
         )
-
-    async def _accumulate(self, classifier: str, reading: DailyReading) -> float:
-        """Compatibility helper for adding one closed day exactly once."""
-        async with self._cumulative_lock:
-            cumulative = await self._load_cumulative()
-            entry = cumulative.get(
-                classifier,
-                {
-                    "completed_day": None,
-                    "completed_cumulative": 0.0,
-                    "cumulative": 0.0,
-                },
-            )
-            previous_day = entry.get("completed_day") or entry.get("day")
-            if previous_day is not None and reading.day <= previous_day:
-                return float(
-                    entry.get("completed_cumulative", entry.get("cumulative", 0.0))
-                )
-
-            baseline = float(
-                entry.get("completed_cumulative", entry.get("cumulative", 0.0))
-            )
-            new_total = self._add_consumption_statistics(
-                classifier,
-                reading,
-                baseline,
-            )
-
-            cumulative[classifier] = {
-                "day": reading.day,
-                "completed_day": reading.day,
-                "completed_cumulative": new_total,
-                "cumulative": new_total,
-            }
-            await self._store.async_save(cumulative)
-            return new_total
 
     async def _refresh_consumption(
         self,
@@ -825,11 +783,3 @@ class GlowmarktDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             int(cost_interval_minutes),
         )
         self.update_interval = timedelta(minutes=self._consumption_interval_minutes)
-
-    def update_tariff_config(self, tariff_config: dict[str, float]) -> None:
-        """Backward-compatible helper used by older callers/tests."""
-        self.tariff_config = tariff_config
-
-    def clear_daily_cache(self) -> None:
-        self._last_readings.clear()
-        self._cost_breakdowns.clear()
