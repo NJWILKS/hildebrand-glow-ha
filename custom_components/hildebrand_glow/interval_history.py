@@ -59,25 +59,6 @@ def _month_key(value: datetime) -> str:
     return f"{local.year:04d}-{local.month:02d}"
 
 
-def _tariff_reference(
-    periods: list[dict[str, Any]],
-    timestamp: datetime,
-) -> str | None:
-    """Return the effective-period key applicable to this interval."""
-    day = timestamp.astimezone(UK_TZ).date()
-    for period in periods:
-        effective_from = datetime.fromisoformat(period["effective_from"]).date()
-        effective_to_raw = period.get("effective_to")
-        effective_to = (
-            datetime.fromisoformat(effective_to_raw).date()
-            if effective_to_raw
-            else None
-        )
-        if day >= effective_from and (effective_to is None or day < effective_to):
-            return period["effective_from"]
-    return None
-
-
 class IntervalHistoryStore:
     """Bounded Home Assistant stores for history metadata and monthly intervals."""
 
@@ -219,10 +200,10 @@ async def _fetch_records(
     resources: dict[str, dict[str, Any]],
     usage_classifier: str,
     cost_classifier: str,
-    tariffs: dict[str, Any],
     start: datetime,
     end: datetime,
 ) -> list[dict[str, Any]]:
+    """Return raw PT30M facts without embedding derived tariff associations."""
     usage_resource = resources.get(usage_classifier)
     cost_resource = resources.get(cost_classifier)
 
@@ -241,19 +222,14 @@ async def _fetch_records(
     cost_by_timestamp = {_utc_iso(timestamp): value for timestamp, value in cost}
     timestamps = sorted(set(usage_by_timestamp) | set(cost_by_timestamp))
 
-    records: list[dict[str, Any]] = []
-    periods = tariffs.get("periods", [])
-    for timestamp_text in timestamps:
-        timestamp = _parse_utc(timestamp_text)
-        records.append(
-            {
-                "timestamp": timestamp_text,
-                "usage_kwh": usage_by_timestamp.get(timestamp_text),
-                "cost_pence": cost_by_timestamp.get(timestamp_text),
-                "tariff_effective_from": _tariff_reference(periods, timestamp),
-            }
-        )
-    return records
+    return [
+        {
+            "timestamp": timestamp_text,
+            "usage_kwh": usage_by_timestamp.get(timestamp_text),
+            "cost_pence": cost_by_timestamp.get(timestamp_text),
+        }
+        for timestamp_text in timestamps
+    ]
 
 
 async def async_populate_interval_history(
@@ -275,8 +251,11 @@ async def async_populate_interval_history(
             continue
 
         state = commodities.setdefault(commodity, {})
-        tariffs = await _load_tariffs(api_client, resources, cost_classifier)
-        state["tariffs"] = tariffs
+        state["tariffs"] = await _load_tariffs(
+            api_client,
+            resources,
+            cost_classifier,
+        )
 
         first = (
             _parse_utc(state["first_interval"])
@@ -307,7 +286,6 @@ async def async_populate_interval_history(
                 resources,
                 usage_classifier,
                 cost_classifier,
-                tariffs,
                 cursor,
                 chunk_end,
             )
