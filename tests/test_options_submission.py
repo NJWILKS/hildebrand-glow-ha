@@ -21,7 +21,6 @@ from custom_components.hildebrand_glow.const import (
 
 @pytest.mark.asyncio
 async def test_settings_submission_changes_options_without_mutating_identity_data(
-    recorder_mock,
     hass,
 ) -> None:
     original_data = {
