@@ -21,13 +21,12 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import GlowmarktDataUpdateCoordinator
-from .cost_ingestion import async_cost_ingestion_worker
 from .identity import sensor_unique_id, site_identity
 
 # All visible sensors are presentation/diagnostic surfaces only. Long-term Energy,
-# total-cost and cost-component history is owned exclusively by integration-owned
-# external statistics. Deliberately omitting state_class from every entity prevents
-# Recorder from creating a second set of long-term statistics.
+# total-cost and cost-component history will be projected from the 2.5 interval
+# ledger. Deliberately omitting state_class prevents Recorder from creating a
+# competing set of long-term statistics while the new ledger is validated.
 SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
     CLASSIFIER_ELECTRICITY_CONSUMPTION: {
         "name": "Electricity Consumption Today",
@@ -169,7 +168,7 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Create supported entities and own the single cost-ingestion worker."""
+    """Create supported presentation entities without a statistics writer."""
     coordinator: GlowmarktDataUpdateCoordinator = hass.data[DOMAIN][
         config_entry.entry_id
     ]
@@ -189,16 +188,6 @@ async def async_setup_entry(
         if _sensor_is_supported(sensor_key, description, coordinator.resources)
     ]
     async_add_entities(entities)
-
-    if any(
-        classifier in coordinator.resources
-        for classifier in (CLASSIFIER_ELECTRICITY_COST, CLASSIFIER_GAS_COST)
-    ):
-        config_entry.async_create_background_task(
-            hass,
-            async_cost_ingestion_worker(hass, coordinator, site_id),
-            f"{DOMAIN} cost ingestion worker",
-        )
 
 
 class GlowmarktSensor(
