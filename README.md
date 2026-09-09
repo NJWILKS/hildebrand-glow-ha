@@ -16,6 +16,7 @@ A maintained rescue fork of the Home Assistant integration for UK SMETS2 smart m
 - Separate integration-owned **Usage Cost** and **Standing Charge** external statistics suitable for stacked daily cost charts.
 - Flat-tariff pricing from actual PT30M consumption × the effective unit rate, with Glow P1D cost retained as a reconciliation oracle.
 - TOU/dynamic fallback to Glow PT30M cost where a single unit rate cannot correctly price the day.
+- One-time cleanup of obsolete Recorder statistics left by earlier entity-backed sensor models.
 - Multi-site Bright account support, API pacing/retry protection, safe reset/rebuild, and regression CI.
 
 ## Installation
@@ -54,7 +55,7 @@ Version 2.3.4 uses one owner for Home Assistant Energy history:
 - each dated interval/hour has a meaningful contextual `state` in kWh;
 - Home Assistant's required cumulative `sum` is maintained internally by the integration;
 - the visible consumption sensor shows **today's published consumption**, not the lifetime cumulative sum;
-- the visible sensor has no `TOTAL_INCREASING` state class, so Recorder cannot create a competing long-term statistic for it.
+- the visible sensor has no Recorder state class, so Recorder cannot create a competing long-term statistic for it.
 
 From 2.3.6, an external Hildebrand consumption source is also paired automatically with its matching external total-cost statistic. Stale fixed/entity price fields left behind by older Home Assistant Energy preferences are cleared when no explicit alternative cost statistic is configured.
 
@@ -108,7 +109,21 @@ The total Energy cost and both chart components are integration-owned external s
 - `hildebrand_glow:<site>_electricity_usage_cost`;
 - `hildebrand_glow:<site>_electricity_standing_charge`.
 
-Gas uses the equivalent `_gas_...` statistic IDs. Earlier entity-backed component statistics are cleared during the 2.3.6 schema rebuild so Recorder is not a second writer.
+Gas uses the equivalent `_gas_...` statistic IDs. The 2.3.6 cost schema rebuilds these external cost statistics under the new ownership model.
+
+## Upgrade cleanup
+
+All visible Hildebrand sensors are presentation/diagnostic entities in 2.3.6 and deliberately have **no Recorder state class**. Long-term consumption and cost history belongs only to the integration-owned external statistics.
+
+On the first 2.3.6 setup for a meter site, the integration removes obsolete Recorder statistics attached to its visible sensor entity IDs. This cleanup:
+
+- runs once per site;
+- removes statistics metadata/data, not the sensor entities themselves;
+- preserves entity registry entries, dashboards and credentials;
+- does not delete current external consumption or cost statistics;
+- does not use broad name/prefix matching, so unrelated Home Assistant statistics are not touched.
+
+The separate cost-ingestion schema migration remains responsible for rebuilding the integration-owned cost statistics when their schema changes.
 
 ## Native stacked cost graph
 
@@ -141,13 +156,13 @@ The integration creates, where the corresponding resource exists:
 - separate current-day standing-charge sensors;
 - combined daily standing charge and total daily energy-cost sensors.
 
-Historical cost-component charting should use the external statistics above rather than relying on the visible sensor entities.
+These visible entities are presentation/diagnostic surfaces only. None carries a Recorder state class. Historical Energy and cost charting should use the integration-owned external statistics rather than the visible sensor entity IDs.
 
 If Glow exposes a resource but no usable reading is currently available, the entity remains **Unknown** rather than being forced to zero.
 
 ## Real-data regression contract
 
-Normal pull-request CI uses no Bright credentials. It runs pytest, Ruff, Hassfest and HACS validation.
+Normal pull-request CI uses no Bright credentials. It runs pytest, Ruff across the production integration and tests, Hassfest and HACS validation.
 
 A separate protected live contract validates the final API semantics against a real Bright account without printing credentials, resource IDs, household readings or tariff values. It checks:
 
