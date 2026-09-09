@@ -16,7 +16,7 @@ from custom_components.hildebrand_glow.cost_ingestion import (
 )
 from custom_components.hildebrand_glow.reset import (
     async_cleanup_legacy_statistics,
-    legacy_cleanup_statistic_ids,
+    legacy_entity_statistic_ids,
     reset_statistic_ids,
 )
 
@@ -72,24 +72,18 @@ def test_reset_statistic_ids_are_scoped_to_entry_and_all_owned_statistics(hass) 
     )
 
 
-def test_upgrade_cleanup_preserves_external_consumption_but_removes_old_cost_stats(hass) -> None:
+def test_upgrade_cleanup_removes_only_entity_backed_sensor_statistics(hass) -> None:
     entry, registry, sensor, button = _entry_and_registry(hass)
 
-    statistic_ids = legacy_cleanup_statistic_ids(registry, entry, "site-123")
+    statistic_ids = legacy_entity_statistic_ids(registry, entry)
 
-    assert sensor.entity_id in statistic_ids
+    assert statistic_ids == [sensor.entity_id]
     assert button.entity_id not in statistic_ids
     assert energy_consumption_statistic_id("site-123", "electricity") not in statistic_ids
-    assert energy_consumption_statistic_id("site-123", "gas") not in statistic_ids
-    assert energy_cost_statistic_id("site-123", "electricity") in statistic_ids
-    assert energy_cost_statistic_id("site-123", "gas") in statistic_ids
+    assert energy_cost_statistic_id("site-123", "electricity") not in statistic_ids
     assert (
         cost_component_statistic_id("site-123", "electricity", "usage_cost")
-        in statistic_ids
-    )
-    assert (
-        cost_component_statistic_id("site-123", "electricity", "standing_charge")
-        in statistic_ids
+        not in statistic_ids
     )
 
 
@@ -106,6 +100,6 @@ async def test_upgrade_cleanup_runs_only_once(hass) -> None:
         first = await async_cleanup_legacy_statistics(hass, entry)
         second = await async_cleanup_legacy_statistics(hass, entry)
 
-    assert sensor.entity_id in first
+    assert first == [sensor.entity_id]
     assert second == []
     clear_statistics.assert_awaited_once()
