@@ -16,6 +16,7 @@ from custom_components.hildebrand_glow.cost_ingestion import (
 )
 from custom_components.hildebrand_glow.reset import (
     async_cleanup_legacy_statistics,
+    async_reset_imported_history,
     legacy_entity_statistic_ids,
     reset_statistic_ids,
 )
@@ -102,4 +103,22 @@ async def test_upgrade_cleanup_runs_only_once(hass) -> None:
 
     assert first == [sensor.entity_id]
     assert second == []
+    clear_statistics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_full_reset_marks_legacy_cleanup_complete(hass) -> None:
+    """A reset must not immediately repeat legacy Recorder cleanup on reload."""
+    entry, _registry, sensor, _button = _entry_and_registry(hass)
+    clear_statistics = AsyncMock()
+
+    with patch(
+        "custom_components.hildebrand_glow.reset._clear_statistics",
+        new=clear_statistics,
+    ):
+        cleared = await async_reset_imported_history(hass, entry)
+        follow_up = await async_cleanup_legacy_statistics(hass, entry)
+
+    assert sensor.entity_id in cleared
+    assert follow_up == []
     clear_statistics.assert_awaited_once()
