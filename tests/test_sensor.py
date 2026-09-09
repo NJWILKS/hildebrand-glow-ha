@@ -8,7 +8,6 @@ from custom_components.hildebrand_glow.const import (
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
     CLASSIFIER_ELECTRICITY_COST,
     CLASSIFIER_GAS_CONSUMPTION,
-    CLASSIFIER_GAS_COST,
     DOMAIN,
 )
 from custom_components.hildebrand_glow.sensor import (
