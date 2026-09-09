@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -149,3 +150,89 @@ async def test_reset_history_requires_confirmation_and_runs_reset(
     assert result["reason"] == "reset_complete"
     assert result["description_placeholders"] == {"count": "2"}
     reset.assert_awaited_once_with(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_loaded_reset_unloads_resets_and_reloads_in_order(recorder_mock, hass) -> None:
+    """The maintenance action must bring an already-loaded config entry back up."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_VIRTUAL_ENTITY: "site-123"},
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
+    calls: list[str] = []
+
+    async def unload(_entry_id: str) -> bool:
+        calls.append("unload")
+        return True
+
+    async def reset(_hass, _entry) -> list[str]:
+        calls.append("reset")
+        return ["hildebrand_glow:cost"]
+
+    async def setup(_entry_id: str) -> bool:
+        calls.append("setup")
+        return True
+
+    with (
+        patch.object(hass.config_entries, "async_unload", side_effect=unload),
+        patch(
+            "custom_components.hildebrand_glow.config_flow.async_reset_imported_history",
+            side_effect=reset,
+        ),
+        patch.object(hass.config_entries, "async_setup", side_effect=setup),
+    ):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={"next_step_id": "reset_history"},
+        )
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={},
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reset_complete"
+    assert calls == ["unload", "reset", "setup"]
+
+
+@pytest.mark.asyncio
+async def test_loaded_reset_does_not_clear_history_when_unload_fails(
+    recorder_mock,
+    hass,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_VIRTUAL_ENTITY: "site-123"},
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
+
+    with (
+        patch.object(
+            hass.config_entries,
+            "async_unload",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "custom_components.hildebrand_glow.config_flow.async_reset_imported_history",
+            new=AsyncMock(),
+        ) as reset,
+        patch.object(hass.config_entries, "async_setup", new=AsyncMock()) as setup,
+    ):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={"next_step_id": "reset_history"},
+        )
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={},
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "reset_failed"}
+    reset.assert_not_awaited()
+    setup.assert_not_awaited()
