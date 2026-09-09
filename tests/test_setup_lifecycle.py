@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,8 +11,8 @@ from custom_components.hildebrand_glow.const import CONF_VIRTUAL_ENTITY, DOMAIN
 
 
 @pytest.mark.asyncio
-async def test_config_entry_setup_does_not_wait_for_legacy_statistics_cleanup(hass) -> None:
-    """Recorder cleanup may be slow, but it must never hold config-entry setup open."""
+async def test_config_entry_setup_starts_only_interval_history_worker(hass) -> None:
+    """2.5 setup must not start any legacy Recorder history machinery."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="DCC Sourced",
@@ -24,46 +23,43 @@ async def test_config_entry_setup_does_not_wait_for_legacy_statistics_cleanup(ha
         },
     )
     entry.add_to_hass(hass)
-
-    cleanup_started = asyncio.Event()
-    cleanup_release = asyncio.Event()
-
-    async def slow_cleanup(*_args) -> list[str]:
-        cleanup_started.set()
-        await cleanup_release.wait()
-        return []
+    entry.async_create_background_task = MagicMock()
 
     coordinator = MagicMock()
     coordinator.async_config_entry_first_refresh = AsyncMock()
-    coordinator.schedule_history_backfill = MagicMock()
     coordinator.async_shutdown = AsyncMock()
+    coordinator.resources = {}
+
+    async def worker_coro() -> None:
+        return None
+
+    task = worker_coro()
+    worker = MagicMock(return_value=task)
 
     with (
         patch(
-            "custom_components.hildebrand_glow.GlowmarktDataUpdateCoordinator",
+            "custom_components.hildebrand_glow.LedgerOnlyGlowmarktDataUpdateCoordinator",
             return_value=coordinator,
         ),
         patch(
-            "custom_components.hildebrand_glow.async_cleanup_legacy_statistics",
-            side_effect=slow_cleanup,
+            "custom_components.hildebrand_glow.async_interval_history_worker",
+            new=worker,
         ),
-        patch(
-            "custom_components.hildebrand_glow.async_migrate_energy_consumption_statistics",
-            new=AsyncMock(return_value=False),
-        ) as migrate,
         patch.object(
             hass.config_entries,
             "async_forward_entry_setups",
             new=AsyncMock(),
         ) as forward,
     ):
-        setup_ok = await asyncio.wait_for(async_setup_entry(hass, entry), timeout=1)
-        assert setup_ok is True
-        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        setup_ok = await async_setup_entry(hass, entry)
 
-        forward.assert_awaited_once_with(entry, ["sensor"])
-        migrate.assert_awaited_once_with(hass, {})
-        coordinator.schedule_history_backfill.assert_called_once_with()
-
-        cleanup_release.set()
-        await asyncio.sleep(0)
+    assert setup_ok is True
+    forward.assert_awaited_once_with(entry, ["sensor"])
+    worker.assert_called_once()
+    entry.async_create_background_task.assert_called_once_with(
+        hass,
+        task,
+        f"{DOMAIN} PT30M interval history population",
+    )
+    coordinator.schedule_history_backfill.assert_not_called()
+    task.close()
