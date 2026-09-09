@@ -13,9 +13,10 @@ A maintained rescue fork of the Home Assistant integration for UK SMETS2 smart m
 - Rolling current-day PT30M ingestion with protection against shorter transient API windows moving Energy statistics backwards.
 - DST-correct 46/48/50 interval handling.
 - Effective-dated Glow tariff history.
-- Separate **Usage Cost** and **Standing Charge** statistics suitable for stacked daily cost charts.
+- Separate integration-owned **Usage Cost** and **Standing Charge** external statistics suitable for stacked daily cost charts.
 - Flat-tariff pricing from actual PT30M consumption × the effective unit rate, with Glow P1D cost retained as a reconciliation oracle.
 - TOU/dynamic fallback to Glow PT30M cost where a single unit rate cannot correctly price the day.
+- One-time cleanup of obsolete Recorder statistics left by earlier entity-backed sensor models.
 - Multi-site Bright account support, API pacing/retry protection, safe reset/rebuild, and regression CI.
 
 ## Installation
@@ -54,7 +55,9 @@ Version 2.3.4 uses one owner for Home Assistant Energy history:
 - each dated interval/hour has a meaningful contextual `state` in kWh;
 - Home Assistant's required cumulative `sum` is maintained internally by the integration;
 - the visible consumption sensor shows **today's published consumption**, not the lifetime cumulative sum;
-- the visible sensor has no `TOTAL_INCREASING` state class, so Recorder cannot create a competing long-term statistic for it.
+- the visible sensor has no Recorder state class, so Recorder cannot create a competing long-term statistic for it.
+
+From 2.3.6, an external Hildebrand consumption source is also paired automatically with its matching external total-cost statistic. Stale fixed/entity price fields left behind by older Home Assistant Energy preferences are cleared when no explicit alternative cost statistic is configured.
 
 ### Fresh install / reset
 
@@ -100,11 +103,31 @@ For TOU or dynamic tariffs, Glow PT30M cost remains the authoritative usage-cost
 
 The standing charge is applied exactly once per UK-local billing day when the effective tariff is known, including the current open day. Glow P1D cost is retained as a completed-day reconciliation oracle rather than being used to distort tariff-derived components.
 
-Historical component statistics are integration-owned to avoid a second Recorder writer.
+The total Energy cost and both chart components are integration-owned external statistics:
+
+- `hildebrand_glow:<site>_electricity_energy_cost`;
+- `hildebrand_glow:<site>_electricity_usage_cost`;
+- `hildebrand_glow:<site>_electricity_standing_charge`.
+
+Gas uses the equivalent `_gas_...` statistic IDs. The 2.3.6 cost schema rebuilds these external cost statistics under the new ownership model.
+
+## Upgrade cleanup
+
+All visible Hildebrand sensors are presentation/diagnostic entities in 2.3.6 and deliberately have **no Recorder state class**. Long-term consumption and cost history belongs only to the integration-owned external statistics.
+
+On the first 2.3.6 setup for a meter site, the integration removes obsolete Recorder statistics attached to its visible sensor entity IDs. This cleanup:
+
+- runs once per site;
+- removes statistics metadata/data, not the sensor entities themselves;
+- preserves entity registry entries, dashboards and credentials;
+- does not delete current external consumption or cost statistics;
+- does not use broad name/prefix matching, so unrelated Home Assistant statistics are not touched.
+
+The separate cost-ingestion schema migration remains responsible for rebuilding the integration-owned cost statistics when their schema changes.
 
 ## Native stacked cost graph
 
-Home Assistant's built-in Statistics Graph card can display the component sensors as stacked daily bars:
+Home Assistant's built-in Statistics Graph card accepts external statistic IDs, so the two component statistics can be displayed directly as stacked daily bars. Use the exact IDs shown under **Developer Tools → Statistics** for your site:
 
 ```yaml
 type: statistics-graph
@@ -112,13 +135,15 @@ title: Electricity Cost
 chart_type: bar-stack
 period: day
 stat_types:
-  - state
+  - change
 entities:
-  - sensor.smart_meter_electricity_usage_cost
-  - sensor.smart_meter_electricity_standing_charge
+  - entity: hildebrand_glow:<site>_electricity_usage_cost
+    name: Usage
+  - entity: hildebrand_glow:<site>_electricity_standing_charge
+    name: Standing charge
 ```
 
-If Home Assistant chose different entity IDs, select the matching Usage Cost and Standing Charge entities in the visual editor.
+`change` is used deliberately: each external statistic keeps a monotonic internal `sum`, so the daily change is exactly that day's usage-cost or standing-charge contribution.
 
 ## Sensors
 
@@ -127,15 +152,17 @@ The integration creates, where the corresponding resource exists:
 - Electricity Consumption Today / Gas Consumption Today;
 - electricity and gas API cost sensors;
 - daily cost sensors;
-- separate usage-cost sensors;
-- separate standing-charge sensors;
+- separate current-day usage-cost sensors;
+- separate current-day standing-charge sensors;
 - combined daily standing charge and total daily energy-cost sensors.
+
+These visible entities are presentation/diagnostic surfaces only. None carries a Recorder state class. Historical Energy and cost charting should use the integration-owned external statistics rather than the visible sensor entity IDs.
 
 If Glow exposes a resource but no usable reading is currently available, the entity remains **Unknown** rather than being forced to zero.
 
 ## Real-data regression contract
 
-Normal pull-request CI uses no Bright credentials. It runs pytest, Ruff, Hassfest and HACS validation.
+Normal pull-request CI uses no Bright credentials. It runs pytest, Ruff across the production integration and tests, Hassfest and HACS validation.
 
 A separate protected live contract validates the final API semantics against a real Bright account without printing credentials, resource IDs, household readings or tariff values. It checks:
 

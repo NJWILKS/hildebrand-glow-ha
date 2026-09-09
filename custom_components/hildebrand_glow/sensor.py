@@ -1,14 +1,9 @@
 """Sensor platform for Hildebrand Glow integration."""
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
-from homeassistant.components.sensor import (
-    SensorDeviceClass,
-    SensorEntity,
-    SensorStateClass,
-)
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
@@ -16,7 +11,6 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import UK_TZ
 from .const import (
     ATTRIBUTION,
     CLASSIFIER_ELECTRICITY_CONSUMPTION,
@@ -30,14 +24,15 @@ from .coordinator import GlowmarktDataUpdateCoordinator
 from .cost_ingestion import async_cost_ingestion_worker
 from .identity import sensor_unique_id, site_identity
 
+# All visible sensors are presentation/diagnostic surfaces only. Long-term Energy,
+# total-cost and cost-component history is owned exclusively by integration-owned
+# external statistics. Deliberately omitting state_class from every entity prevents
+# Recorder from creating a second set of long-term statistics.
 SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
     CLASSIFIER_ELECTRICITY_CONSUMPTION: {
         "name": "Electricity Consumption Today",
         "icon": "mdi:flash",
         "device_class": SensorDeviceClass.ENERGY,
-        # The visible sensor is a useful daily value. Historical/open-day Energy
-        # statistics are integration-owned external rows, so Recorder must not
-        # compile a second lifetime TOTAL_INCREASING series from this entity.
         "native_unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
         "data_key": "readings",
         "reading_key": CLASSIFIER_ELECTRICITY_CONSUMPTION,
@@ -54,7 +49,6 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Electricity Cost (API)",
         "icon": "mdi:currency-gbp",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
         "native_unit_of_measurement": "GBP",
         "data_key": "readings",
         "reading_key": CLASSIFIER_ELECTRICITY_COST,
@@ -65,7 +59,6 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Gas Cost (API)",
         "icon": "mdi:currency-gbp",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
         "native_unit_of_measurement": "GBP",
         "data_key": "readings",
         "reading_key": CLASSIFIER_GAS_COST,
@@ -76,24 +69,19 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Electricity Daily Cost",
         "icon": "mdi:currency-gbp",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "electricity",
         "diagnostic_commodity": "electricity",
-        "daily_reset": True,
     },
     "electricity_usage_cost": {
         "name": "Electricity Usage Cost",
         "icon": "mdi:flash-outline",
         "device_class": SensorDeviceClass.MONETARY,
-        # Historical and current-day statistics for the stacked cost chart are
-        # imported by the integration. No state class means there is one writer.
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "electricity_usage",
         "diagnostic_commodity": "electricity",
-        "daily_reset": True,
     },
     "electricity_standing_charge": {
         "name": "Electricity Standing Charge",
@@ -103,18 +91,15 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "costs",
         "reading_key": "electricity_standing_charge",
         "diagnostic_commodity": "electricity",
-        "daily_reset": True,
     },
     "gas_daily_cost": {
         "name": "Gas Daily Cost",
         "icon": "mdi:currency-gbp",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "gas",
         "diagnostic_commodity": "gas",
-        "daily_reset": True,
     },
     "gas_usage_cost": {
         "name": "Gas Usage Cost",
@@ -124,7 +109,6 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "costs",
         "reading_key": "gas_usage",
         "diagnostic_commodity": "gas",
-        "daily_reset": True,
     },
     "gas_standing_charge": {
         "name": "Gas Standing Charge",
@@ -134,13 +118,11 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "data_key": "costs",
         "reading_key": "gas_standing_charge",
         "diagnostic_commodity": "gas",
-        "daily_reset": True,
     },
     "total_daily_cost": {
         "name": "Total Daily Energy Cost",
         "icon": "mdi:currency-gbp",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "total",
@@ -149,7 +131,6 @@ SENSOR_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "name": "Daily Standing Charges",
         "icon": "mdi:cash-clock",
         "device_class": SensorDeviceClass.MONETARY,
-        "state_class": SensorStateClass.TOTAL,
         "native_unit_of_measurement": "GBP",
         "data_key": "costs",
         "reading_key": "standing_charges_total",
@@ -229,7 +210,6 @@ class GlowmarktSensor(
         self._attr_name = description["name"]
         self._attr_icon = description.get("icon")
         self._attr_device_class = description.get("device_class")
-        self._attr_state_class = description.get("state_class")
         self._attr_native_unit_of_measurement = description.get(
             "native_unit_of_measurement"
         )
@@ -267,22 +247,6 @@ class GlowmarktSensor(
                 return round(value, 2)
             return round(value, 3)
         return value
-
-    @property
-    def last_reset(self) -> datetime | None:
-        """Return the UK-local billing-day boundary for daily monetary sensors."""
-        if not self._description.get("daily_reset") or self.coordinator.data is None:
-            return None
-        commodity = self._description.get("diagnostic_commodity")
-        if not isinstance(commodity, str):
-            return None
-        diagnostics = self.coordinator.data.get("cost_diagnostics", {}).get(commodity)
-        if not diagnostics:
-            return None
-        api_day = diagnostics.get("api_day")
-        if not isinstance(api_day, str) or not api_day:
-            return None
-        return datetime.fromisoformat(api_day).replace(tzinfo=UK_TZ)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:

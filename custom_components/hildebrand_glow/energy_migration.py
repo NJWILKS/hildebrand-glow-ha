@@ -27,17 +27,25 @@ def _matching_cost_statistic(consumption_statistic: object) -> str | None:
     )
 
 
-def _bind_cost_if_unconfigured(source: dict) -> bool:
-    """Attach our external cost statistic without overriding a user price source."""
+def _bind_owned_cost(source: dict) -> bool:
+    """Make this integration's external total-cost statistic authoritative.
+
+    Home Assistant does not support entity/fixed-price costing for an external
+    consumption statistic. Older Energy preferences can nevertheless retain one of
+    those stale fields after the consumption source is migrated. When the source is
+    one of our external consumption statistics and no explicit cost statistic has
+    been chosen, clear those stale price fields and bind the matching external cost
+    statistic instead.
+    """
     cost_statistic = _matching_cost_statistic(source.get("stat_energy_from"))
-    if cost_statistic is None:
+    if cost_statistic is None or source.get("stat_cost") is not None:
         return False
-    if source.get("stat_cost") is not None:
-        return False
+
     if source.get("entity_energy_price") is not None:
-        return False
+        source["entity_energy_price"] = None
     if source.get("number_energy_price") is not None:
-        return False
+        source["number_energy_price"] = None
+
     source["stat_cost"] = cost_statistic
     return True
 
@@ -53,10 +61,11 @@ async def async_migrate_energy_consumption_statistics(
     statistic owner instead. Existing Energy-dashboard configuration is migrated
     in place so users do not have to remove/re-add their grid or gas source.
 
-    The external cost statistic is also attached when the Energy source uses this
-    integration's external consumption statistic and no explicit user cost/price
-    source is configured. This makes an existing 2.3.4 Energy source pick up the
-    historical cost statistic automatically after upgrade/restart.
+    From 2.3.6, an already-external Hildebrand source is also repaired when Home
+    Assistant is still carrying a stale fixed/entity price (for example an old gas
+    rate on the electricity source). The matching integration-owned total-cost
+    statistic becomes authoritative without touching an explicitly selected
+    alternative cost statistic.
     """
     manager = await async_get_manager(hass)
     if manager.data is None:
@@ -71,7 +80,7 @@ async def async_migrate_energy_consumption_statistics(
         if isinstance(current, str) and current in legacy_to_external:
             source["stat_energy_from"] = legacy_to_external[current]
             changed = True
-        if _bind_cost_if_unconfigured(source):
+        if _bind_owned_cost(source):
             changed = True
 
         # Be conservative with an old, not-yet-migrated grid preference shape.
@@ -84,7 +93,7 @@ async def async_migrate_energy_consumption_statistics(
                 if isinstance(current, str) and current in legacy_to_external:
                     flow["stat_energy_from"] = legacy_to_external[current]
                     changed = True
-                if _bind_cost_if_unconfigured(flow):
+                if _bind_owned_cost(flow):
                     changed = True
 
     if changed:

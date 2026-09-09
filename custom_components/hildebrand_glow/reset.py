@@ -1,4 +1,4 @@
-"""Safe reset helpers for Hildebrand Glow imported history."""
+"""Safe reset and one-time cleanup helpers for Hildebrand Glow statistics."""
 from __future__ import annotations
 
 import asyncio
@@ -15,9 +15,25 @@ from .coordinator import CUMULATIVE_STORAGE_VERSION
 from .cost_ingestion import (
     COST_HISTORY_STORAGE_VERSION,
     TARIFF_HISTORY_STORAGE_VERSION,
+    cost_component_statistic_id,
     energy_cost_statistic_id,
 )
 from .identity import site_identity
+
+LEGACY_CLEANUP_STORAGE_VERSION = 1
+LEGACY_CLEANUP_SCHEMA_VERSION = 1
+
+
+def _entry_sensor_statistic_ids(
+    registry: er.EntityRegistry,
+    config_entry: ConfigEntry,
+) -> set[str]:
+    """Return sensor entity IDs owned by this config entry."""
+    return {
+        entry.entity_id
+        for entry in er.async_entries_for_config_entry(registry, config_entry.entry_id)
+        if entry.domain == "sensor"
+    }
 
 
 def reset_statistic_ids(
@@ -26,23 +42,33 @@ def reset_statistic_ids(
     site_id: str,
 ) -> list[str]:
     """Return all current and legacy Hildebrand statistics for one config entry."""
-    # Entity-backed IDs include legacy consumption statistics from <=2.3.3 as well
-    # as current monetary sensor statistics. Keeping them in the reset set makes
-    # upgrades self-cleaning without touching unrelated Recorder data.
-    statistic_ids = {
-        entry.entity_id
-        for entry in er.async_entries_for_config_entry(registry, config_entry.entry_id)
-        if entry.domain == "sensor"
-    }
+    statistic_ids = _entry_sensor_statistic_ids(registry, config_entry)
     statistic_ids.update(
         {
             energy_consumption_statistic_id(site_id, "electricity"),
             energy_consumption_statistic_id(site_id, "gas"),
             energy_cost_statistic_id(site_id, "electricity"),
             energy_cost_statistic_id(site_id, "gas"),
+            cost_component_statistic_id(site_id, "electricity", "usage_cost"),
+            cost_component_statistic_id(site_id, "electricity", "standing_charge"),
+            cost_component_statistic_id(site_id, "gas", "usage_cost"),
+            cost_component_statistic_id(site_id, "gas", "standing_charge"),
         }
     )
     return sorted(statistic_ids)
+
+
+def legacy_entity_statistic_ids(
+    registry: er.EntityRegistry,
+    config_entry: ConfigEntry,
+) -> list[str]:
+    """Return obsolete Recorder-owned statistics created from visible sensors.
+
+    The 2.3.6 cost schema owns rebuilding its external cost statistics. This cleanup
+    therefore touches only entity-backed statistics that can no longer be recreated,
+    and deliberately leaves all current external statistics to their normal owners.
+    """
+    return sorted(_entry_sensor_statistic_ids(registry, config_entry))
 
 
 async def _clear_statistics(hass: HomeAssistant, statistic_ids: list[str]) -> None:
@@ -57,6 +83,35 @@ async def _clear_statistics(hass: HomeAssistant, statistic_ids: list[str]) -> No
 
     get_instance(hass).async_clear_statistics(statistic_ids, on_done=_done)
     await done.wait()
+
+
+async def async_cleanup_legacy_statistics(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+) -> list[str]:
+    """Remove obsolete Recorder-owned visible-sensor statistics exactly once.
+
+    All visible sensors are presentation-only from 2.3.6. Earlier releases could
+    create long-term Recorder statistics for those entity IDs, so their metadata is
+    deleted once. Current integration-owned external statistics are not touched.
+    """
+    site_id = site_identity(
+        config_entry.data.get(CONF_VIRTUAL_ENTITY),
+        config_entry.entry_id,
+    )
+    store = Store(
+        hass,
+        LEGACY_CLEANUP_STORAGE_VERSION,
+        f"{DOMAIN}_{site_id}_statistics_cleanup",
+    )
+    state = await store.async_load() or {}
+    if int(state.get("schema_version", 0) or 0) >= LEGACY_CLEANUP_SCHEMA_VERSION:
+        return []
+
+    statistic_ids = legacy_entity_statistic_ids(er.async_get(hass), config_entry)
+    await _clear_statistics(hass, statistic_ids)
+    await store.async_save({"schema_version": LEGACY_CLEANUP_SCHEMA_VERSION})
+    return statistic_ids
 
 
 async def async_reset_imported_history(

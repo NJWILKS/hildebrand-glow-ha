@@ -1,6 +1,6 @@
 # Home Assistant Energy dashboard
 
-Version 2.3.4 gives Hildebrand one statistics owner for Energy consumption and one tariff-first model for cost composition.
+Version 2.3.6 gives Hildebrand one statistics owner for Energy consumption, one external total-cost source for the native Energy dashboard, and separate external usage/standing statistics for stacked analysis.
 
 ## Built-in Energy dashboard
 
@@ -9,7 +9,9 @@ Configure **Settings → Dashboards → Energy → Electricity grid** with:
 - **Energy imported from grid:** the external statistic named **Hildebrand Glow Electricity Energy Consumption**.
 - **Cost tracking:** the external statistic named **Hildebrand Glow Electricity Energy Cost**.
 
-Upgrading from an earlier 2.3.x release migrates an existing Hildebrand Energy source from the old live-sensor statistic to the stable external consumption statistic automatically. The visible `Electricity Consumption Today` sensor is deliberately presentation-only and is not a second long-term statistics writer.
+Upgrading from an earlier 2.3.x release migrates an existing Hildebrand Energy source from the old live-sensor statistic to the stable external consumption statistic automatically. Version 2.3.6 also repairs stale fixed/entity price fields left behind on an already-external Hildebrand source and binds the matching external total-cost statistic when no explicit alternative cost statistic is selected.
+
+All visible Hildebrand sensors are presentation/diagnostic surfaces in 2.3.6 and deliberately have no Recorder state class. They therefore cannot recreate a second long-term statistics series.
 
 Do not use `Total Daily Energy Cost` for the electricity grid. That entity can combine electricity and gas when both commodities are available.
 
@@ -33,6 +35,14 @@ The dedicated Energy total-cost statistic uses the same usage + standing composi
 
 The current day can include the standing charge immediately once the effective tariff is known; it no longer has to wait for Glow's next-day P1D aggregate before the stacked chart can show the fixed daily charge.
 
+## Upgrade cleanup
+
+On the first 2.3.6 setup for each Hildebrand site, the integration removes obsolete Recorder statistics belonging to its visible sensor entity IDs. It does **not** delete the entities themselves and does not touch the integration-owned external statistics.
+
+This is intentionally narrower than a name/prefix cleanup: only sensors registered to the current config entry are selected. That preserves dashboards, entity registry entries, credentials, external Energy history and unrelated Home Assistant statistics. A small per-site marker makes the cleanup one-time so a later restart cannot delete freshly rebuilt data.
+
+The cost-ingestion schema migration separately clears/rebuilds the external total-cost, usage-cost and standing-charge statistics when their schema changes.
+
 ## Reset imported history
 
 Use **Settings → Devices & services → Hildebrand Glow → Configure → Reset imported history**.
@@ -41,6 +51,7 @@ The reset is scoped to the selected Hildebrand meter site. It:
 
 - clears the integration-owned historical statistics;
 - clears the dedicated Hildebrand electricity/gas Energy statistics;
+- clears the external usage-cost and standing-charge component statistics;
 - removes the integration's consumption, cost and tariff-ledger cache files;
 - preserves credentials, entity registry entries, dashboard configuration and unrelated Home Assistant history;
 - reloads the config entry so consumption, tariff and cost history are rebuilt deterministically from Glow.
@@ -49,12 +60,12 @@ The stable external statistic IDs mean an existing Energy dashboard can be migra
 
 ## Usage cost versus standing charge graph
 
-The two component statistics are attached to the normal Hildebrand entities:
+Version 2.3.6 publishes the two chart components as integration-owned external statistics rather than attaching long-term history to visible sensor entities:
 
-- `Smart Meter Electricity Usage Cost`
-- `Smart Meter Electricity Standing Charge`
+- `hildebrand_glow:<site>_electricity_usage_cost`
+- `hildebrand_glow:<site>_electricity_standing_charge`
 
-Both historical and current-day statistics are imported by the integration. The live entities deliberately do not carry a Recorder state class, which prevents Home Assistant from creating a competing second statistics series.
+The visible Usage Cost / Standing Charge entities remain useful current-day presentation values, but historical charting should use the external statistic IDs above. This avoids Recorder becoming a competing statistics owner and also avoids orphaned-entity history confusing the chart.
 
 Example native stacked card:
 
@@ -64,20 +75,24 @@ title: Electricity Cost
 chart_type: bar-stack
 period: day
 stat_types:
-  - state
+  - change
 entities:
-  - sensor.smart_meter_electricity_usage_cost
-  - sensor.smart_meter_electricity_standing_charge
+  - entity: hildebrand_glow:<site>_electricity_usage_cost
+    name: Usage
+  - entity: hildebrand_glow:<site>_electricity_standing_charge
+    name: Standing charge
 ```
 
-Each daily bar therefore reads as:
+Use the exact external statistic IDs shown in **Developer Tools → Statistics** for the selected site.
+
+`change` is used deliberately. Both external component statistics maintain a monotonic internal `sum`; the daily change is therefore exactly that day's usage cost or standing charge.
+
+Each daily bar reads as:
 
 - lower segment: actual usage cost at the effective tariff rate;
 - upper segment: that day's effective standing charge;
 - full bar height: the same daily total used by the dedicated Energy cost statistic.
 
-Home Assistant may choose different entity IDs if similarly named entities already existed; use the entity picker or the actual registry IDs in YAML.
-
 ## Gas
 
-Gas follows the same model when usable gas data is available: external consumption + external total-cost statistics for the Energy dashboard, and separate usage/standing component entities for stacked analysis. If a DCC/Glow gas resource exists but has no readings, the values remain unavailable rather than being silently treated as zero.
+Gas follows the same model when usable gas data is available: external consumption + external total-cost statistics for the Energy dashboard, plus external usage-cost and standing-charge component statistics for stacked analysis. If a DCC/Glow gas resource exists but has no readings, the values remain unavailable rather than being silently treated as zero.

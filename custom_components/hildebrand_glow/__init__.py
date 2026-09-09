@@ -25,6 +25,7 @@ from .const import (
 )
 from .coordinator import GlowmarktDataUpdateCoordinator
 from .energy_migration import async_migrate_energy_consumption_statistics
+from .reset import async_cleanup_legacy_statistics
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
@@ -85,6 +86,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN][entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # 2.3.6 makes every visible sensor presentation-only and moves all long-term
+    # cost history to integration-owned external statistics. Remove the obsolete
+    # Recorder-owned sensor statistics once before rebuilding the new cost schema.
+    await async_cleanup_legacy_statistics(hass, entry)
 
     # 2.3.4 migrated Energy consumption to an external statistic but did not
     # attach the integration-owned external cost statistic to the same Energy

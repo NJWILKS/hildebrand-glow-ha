@@ -54,23 +54,6 @@ class FakeApi:
             }
         )
 
-        async def get_readings(classifiers: set[str] | None = None):
-            all_readings = {
-                CLASSIFIER_ELECTRICITY_CONSUMPTION: FakeReading(
-                    "2026-09-05", 10.0, []
-                ),
-                CLASSIFIER_GAS_CONSUMPTION: FakeReading(
-                    "2026-09-05", 20.0, []
-                ),
-            }
-            if classifiers is None:
-                return all_readings
-            return {
-                classifier: reading
-                for classifier, reading in all_readings.items()
-                if classifier in classifiers
-            }
-
         async def fetch_day_reading(
             resource_id: str,
             start: datetime,
@@ -105,10 +88,8 @@ class FakeApi:
                 return []
             return [[timestamp, value]]
 
-        self.get_readings = AsyncMock(side_effect=get_readings)
         self._fetch_day_reading = AsyncMock(side_effect=fetch_day_reading)
         self._request_readings = AsyncMock(side_effect=request_readings)
-        self.get_available_readings = AsyncMock(return_value={})
 
 
 def _make_coordinator(
@@ -299,44 +280,6 @@ def test_coordinator_identity_survives_config_entry_recreation(hass) -> None:
 
     assert first._site_id == "site-2"
     assert second._site_id == "site-2"
-
-
-@pytest.mark.asyncio
-async def test_accumulation_counts_each_calendar_day_once_across_restart(hass) -> None:
-    shared_state: dict = {}
-    first_api = FakeApi()
-    first = _make_coordinator(hass, first_api)
-    first._store = FakeStore(shared_state)
-
-    day_one = FakeReading("2026-09-04", 10.0, [])
-    assert await first._accumulate(CLASSIFIER_ELECTRICITY_CONSUMPTION, day_one) == 10.0
-    assert await first._accumulate(CLASSIFIER_ELECTRICITY_CONSUMPTION, day_one) == 10.0
-
-    second_api = FakeApi()
-    restarted = _make_coordinator(hass, second_api)
-    restarted._store = FakeStore(shared_state)
-    day_two = FakeReading("2026-09-05", 5.0, [])
-
-    assert (
-        await restarted._accumulate(
-            CLASSIFIER_ELECTRICITY_CONSUMPTION,
-            day_one,
-        )
-        == 10.0
-    )
-    assert (
-        await restarted._accumulate(
-            CLASSIFIER_ELECTRICITY_CONSUMPTION,
-            day_two,
-        )
-        == 15.0
-    )
-    assert shared_state[CLASSIFIER_ELECTRICITY_CONSUMPTION] == {
-        "day": "2026-09-05",
-        "completed_day": "2026-09-05",
-        "completed_cumulative": 15.0,
-        "cumulative": 15.0,
-    }
 
 
 @pytest.mark.asyncio

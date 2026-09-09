@@ -128,7 +128,7 @@ async def test_energy_migration_binds_cost_for_legacy_grid_flow_shape() -> None:
 
 
 @pytest.mark.asyncio
-async def test_energy_migration_does_not_override_user_price_configuration() -> None:
+async def test_energy_migration_replaces_stale_fixed_price_on_external_source() -> None:
     manager = SimpleNamespace(
         data={
             "energy_sources": [
@@ -137,7 +137,66 @@ async def test_energy_migration_does_not_override_user_price_configuration() -> 
                     "stat_energy_from": "hildebrand_glow:site_electricity_energy_consumption",
                     "stat_cost": None,
                     "entity_energy_price": None,
-                    "number_energy_price": 0.25,
+                    "number_energy_price": 0.06,
+                }
+            ]
+        },
+        async_update=AsyncMock(),
+    )
+
+    with patch(
+        "custom_components.hildebrand_glow.energy_migration.async_get_manager",
+        new=AsyncMock(return_value=manager),
+    ):
+        changed = await async_migrate_energy_consumption_statistics(object(), {})
+
+    assert changed is True
+    updated = manager.async_update.await_args.args[0]["energy_sources"]
+    assert updated[0]["stat_cost"] == "hildebrand_glow:site_electricity_energy_cost"
+    assert updated[0]["entity_energy_price"] is None
+    assert updated[0]["number_energy_price"] is None
+
+
+@pytest.mark.asyncio
+async def test_energy_migration_replaces_stale_price_entity_on_external_source() -> None:
+    manager = SimpleNamespace(
+        data={
+            "energy_sources": [
+                {
+                    "type": "grid",
+                    "stat_energy_from": "hildebrand_glow:site_electricity_energy_consumption",
+                    "stat_cost": None,
+                    "entity_energy_price": "sensor.old_electricity_price",
+                    "number_energy_price": None,
+                }
+            ]
+        },
+        async_update=AsyncMock(),
+    )
+
+    with patch(
+        "custom_components.hildebrand_glow.energy_migration.async_get_manager",
+        new=AsyncMock(return_value=manager),
+    ):
+        changed = await async_migrate_energy_consumption_statistics(object(), {})
+
+    assert changed is True
+    updated = manager.async_update.await_args.args[0]["energy_sources"]
+    assert updated[0]["stat_cost"] == "hildebrand_glow:site_electricity_energy_cost"
+    assert updated[0]["entity_energy_price"] is None
+
+
+@pytest.mark.asyncio
+async def test_energy_migration_preserves_explicit_alternative_cost_statistic() -> None:
+    manager = SimpleNamespace(
+        data={
+            "energy_sources": [
+                {
+                    "type": "grid",
+                    "stat_energy_from": "hildebrand_glow:site_electricity_energy_consumption",
+                    "stat_cost": "sensor.user_selected_energy_cost",
+                    "entity_energy_price": None,
+                    "number_energy_price": None,
                 }
             ]
         },
