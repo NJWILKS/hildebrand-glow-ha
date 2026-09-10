@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,7 +7,6 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.hildebrand_glow import (
-    _async_cleanup_legacy_statistics_after_setup,
     _tariff_config,
     async_unload_entry,
     async_update_options,
@@ -102,32 +99,3 @@ async def test_unload_always_stops_coordinator_and_only_removes_data_on_success(
     coordinator.async_shutdown.assert_awaited_once_with()
     unload.assert_awaited_once()
     assert (entry.entry_id in hass.data[DOMAIN]) is (not unload_ok)
-
-
-@pytest.mark.asyncio
-async def test_cleanup_failure_is_logged_without_escaping(hass, caplog) -> None:
-    entry = _entry()
-    error = RuntimeError("recorder unavailable")
-
-    with (
-        patch(
-            "custom_components.hildebrand_glow.async_cleanup_legacy_statistics",
-            new=AsyncMock(side_effect=error),
-        ),
-        caplog.at_level(logging.ERROR),
-    ):
-        await _async_cleanup_legacy_statistics_after_setup(hass, entry)
-
-    assert "Failed to clean up legacy Hildebrand statistics" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_cleanup_cancellation_propagates(hass) -> None:
-    entry = _entry()
-
-    with patch(
-        "custom_components.hildebrand_glow.async_cleanup_legacy_statistics",
-        new=AsyncMock(side_effect=asyncio.CancelledError),
-    ):
-        with pytest.raises(asyncio.CancelledError):
-            await _async_cleanup_legacy_statistics_after_setup(hass, entry)
